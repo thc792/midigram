@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Libreria Musicale - Visualizzatore MIDI</title>
+    <!-- Collegamento al file CSS esterno -->
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <h1>Visualizzatore MIDI Completo</h1>
+
+    <!-- Sezione Input File -->
+    <div>
+        <label for="midi-file-input">Carica File MIDI:</label>
+        <input type="file" id="midi-file-input" accept=".mid,.midi">
+    </div>
+
+    <!-- Pulsanti di Playback ed Esportazione -->
+    <div style="margin-top: 1em; margin-bottom: 1em;">
+        <button id="play-button" disabled>Play</button>
+        <button id="stop-button" disabled>Stop</button>
+        <span id="playback-status" style="margin-left: 1em;"></span>
+        <!-- NUOVO PULSANTE ESPORTA -->
+        <button id="export-png-button" style="margin-left: 2em;" disabled>Esporta PNG</button>
+    </div>
+
+    <!-- Display Accuratezza -->
+    <div id="accuracy-display">Accuratezza: N/A</div>
+
+    <!-- Contenitore dove VexFlow disegnerà la partitura -->
+    <div id="pentagramma-container">
+        <!-- Il contenuto SVG verrà inserito qui da VexFlow -->
+    </div>
+
+    <!-- SEZIONE LIBRERIE SCRIPT -->
+    <!-- ======================= -->
+    <!-- IMPORTANTE: L'ordine qui sotto è FONDAMENTALE -->
+
+    <!-- 1. PRIMA VexFlow -->
+    <script src="https://unpkg.com/vexflow@4.2.3/build/cjs/vexflow.js"></script>
+
+    <!-- 2. DOPO VexFlow, la libreria midi-parser-js -->
+    <!-- Assicurati che 'midi-parser.js' sia nella stessa cartella o aggiorna il percorso -->
+    <script src="midi-parser.js"></script>
+
+    <!-- 3. AGGIUNGI html2canvas PRIMA del tuo script -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js" integrity="sha512-BNaRQnYJYiPSqHHDb58B0yaPfCu+Wgds8Gp/gU33kqBtgNS4tSPHuGibyoeqMV/TJlSKda6FXzoEyYGjTe+vXA==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+
+    <!-- 4. PER ULTIMO, il tuo script principale -->
+    <script src="script.js"></script>
+
+    <!-- ======================= -->
+    <!-- FINE SEZIONE SCRIPT -->
+
+</body>
+</html>

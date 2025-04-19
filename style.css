@@ -1,0 +1,96 @@
+body {
+    font-family: sans-serif;
+    line-height: 1.6;
+    margin: 20px;
+    background-color: #f8f8f8; /* Sfondo leggermente grigio per contrasto */
+}
+
+#pentagramma-container {
+    margin-top: 20px;
+    border: 1px solid #ccc;
+    /* Permette lo scrolling se il contenuto è troppo alto */
+    max-height: 75vh; /* Aumentata leggermente l'altezza massima */
+    overflow-y: auto;  /* Aggiunge scrollbar verticale se necessario */
+    overflow-x: hidden; /* Nasconde scrollbar orizzontale (spesso non voluta) */
+    width: 95%; /* Larghezza per contenere i pentagrammi */
+    padding: 15px; /* Aumentato leggermente il padding interno */
+    box-sizing: border-box; /* Assicura che padding e border siano inclusi nella width/height */
+    background-color: #fff; /* Sfondo bianco per il pentagramma */
+    position: relative; /* Utile per lo scroll automatico JS */
+}
+
+#accuracy-display {
+    margin-top: 10px;
+    margin-bottom: 10px; /* Aggiunto spazio sotto */
+    font-weight: bold;
+    font-size: 1.1em; /* Leggermente più grande */
+    color: #333;
+}
+
+label {
+    margin-right: 10px;
+    font-weight: bold;
+}
+
+input[type="file"] {
+    padding: 5px;
+}
+
+/* --- Stili Specifici per Note VexFlow --- */
+
+/* Selettore CORRETTO:
+   Cerca un elemento <g> con classe 'correct-note' DENTRO #pentagramma-container svg,
+   e poi applica lo stile agli elementi <path> DENTRO .vf-notehead, .vf-stem, .vf-flag
+   che si trovano all'interno di quel gruppo <g>.
+*/
+
+/* Nota Corretta */
+#pentagramma-container svg g.correct-note .vf-notehead path,
+#pentagramma-container svg g.correct-note .vf-stem path,
+#pentagramma-container svg g.correct-note .vf-flag path {
+    /* Un verde più leggibile e meno aggressivo */
+    fill: mediumseagreen !important;
+    stroke: seagreen !important;
+}
+
+/* Nota Corrente Evidenziata (usa la classe definita nel JS) */
+#pentagramma-container svg g.current-note-highlight .vf-notehead path,
+#pentagramma-container svg g.current-note-highlight .vf-stem path,
+#pentagramma-container svg g.current-note-highlight .vf-flag path {
+    fill: orange !important;
+    stroke: darkorange !important;
+    /* Puoi sperimentare con un filtro per un effetto "glow" */
+    /* filter: drop-shadow(0 0 3px orange); */
+}
+
+/* Animazione per il Flash della Nota Sbagliata */
+@keyframes incorrectFlash {
+    0%, 100% {
+        /* Colore flash */
+        fill: red !important;
+        stroke: darkred !important;
+    }
+    50% {
+        /* Ritorna al colore di default della nota (nero) per creare l'effetto flash */
+        /* 'inherit' potrebbe non funzionare a causa di !important, meglio specificare il nero */
+        fill: black !important;
+        stroke: black !important;
+    }
+}
+
+/* Nota Sbagliata (classe temporanea aggiunta da JS) */
+/* Applica l'animazione solo alla testa della nota per semplicità */
+#pentagramma-container svg g.incorrect-note-flash .vf-notehead path {
+    /* Applica l'animazione definita sopra */
+    animation: incorrectFlash 0.5s ease-in-out;
+}
+
+/* Opzionale: Stile di base per le note (se vuoi cambiare il nero di default) */
+/*
+#pentagramma-container svg .vf-notehead path,
+#pentagramma-container svg .vf-stem path,
+#pentagramma-container svg .vf-flag path {
+    fill: #333;
+    stroke: #333;
+}
+*/
