@@ -2,12 +2,17 @@ body {
     font-family: sans-serif;
     line-height: 1.6;
     margin: 20px;
-    background-color: #f8f8f8;
+    background-color: #f0ead6;
+    color: #4e342e;
+}
+
+h1 {
+    color: #3e2723;
 }
 
 #pentagramma-container {
     margin-top: 20px;
-    border: 1px solid #ccc;
+    border: 1px solid #a1887f;
     max-height: 75vh;
     overflow-y: auto;
     overflow-x: hidden;
@@ -23,16 +28,21 @@ body {
     margin-bottom: 10px;
     font-weight: bold;
     font-size: 1.1em;
-    color: #333;
+    color: inherit;
 }
 
 label {
     margin-right: 10px;
     font-weight: bold;
+    color: inherit;
 }
 
 input[type="file"] {
     padding: 5px;
+}
+
+#pentagramma-container svg .vf-stem path {
+    stroke-width: 0.8px !important;
 }
 
 #pentagramma-container svg g.correct-note .vf-notehead path,
@@ -55,15 +65,11 @@ input[type="file"] {
         stroke: darkred !important;
     }
     50% {
-        fill: black !important;
-        stroke: black !important;
+        fill: #000 !important;
+        stroke: #000 !important;
     }
 }
-/* Nuovo stile per rendere le linee di steli e legature (beams) più sottili */
-#pentagramma-container svg .vf-stem path { /* <--- Stringa che altera il valore */
-    stroke-width: 0.8px !important; /* Imposta la larghezza del tratto. Puoi provare valori diversi (es. 0.5px, 1px) */
-    /* !important è spesso necessario per sovrascrivere gli stili inline di VexFlow */
-}
+
 #pentagramma-container svg g.incorrect-note-flash .vf-notehead path {
     animation: incorrectFlash 0.5s ease-in-out;
 }

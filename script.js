@@ -1,7 +1,6 @@
 /*
 Copyright © 2024 lorenzetti giuseppe. All rights reserved.
 */
-
 const { Renderer, Stave, StaveNote, Beam, Formatter, StaveConnector, Voice, Accidental, Dot, TickContext, Barline } = Vex.Flow;
 const VF = Vex.Flow;
 
@@ -14,6 +13,7 @@ const statusDisplay = document.getElementById('playback-status');
 const playButton = document.getElementById('play-button');
 const stopButton = document.getElementById('stop-button');
 const exportPngButton = document.getElementById('export-png-button');
+const exportExerciseButton = document.getElementById('export-exercise-button'); // Nuovo pulsante
 const speedSlider = document.getElementById('speed-slider');
 const speedValueSpan = document.getElementById('speed-value');
 const accuracyDisplay = document.getElementById('accuracy-display');
@@ -29,6 +29,7 @@ const MIN_REST_TICKS = 1;
 
 let ppq = 480;
 let vexflowData = null;
+let allParsedNotesFromBackend = []; // Manteniamo i dati raw dal backend
 let playbackInterval = null;
 let currentNoteIndex = -1;
 let allParsedNotesFlattened = [];
@@ -124,7 +125,6 @@ function groupNotesByMeasure(notes, timeSignature, ppqInput) {
     notes.sort((a, b) => a.ticks - b.ticks || a.midi - b.midi);
 
     if (notes.length > 0 && notes[0].ticks > TICK_TOLERANCE_FOR_CHORDS) {
-        // CORREZIONE QUI: TICK_TICK_TOLERANCE_FOR_CHORDS -> TICK_TOLERANCE_FOR_CHORDS
         let initialEmptyMeasures = Math.floor((notes[0].ticks - TICK_TOLERANCE_FOR_CHORDS) / ticksPerMeasure);
         if (initialEmptyMeasures < 0) initialEmptyMeasures = 0;
 
@@ -143,7 +143,6 @@ function groupNotesByMeasure(notes, timeSignature, ppqInput) {
 
     notes.forEach(note => {
         const noteStartTickAdjusted = note.ticks - currentMeasureStartTick;
-        // CORREZIONE QUI: TICK_TICK_TOLERANCE_FOR_CHORDS -> TICK_TOLERANCE_FOR_CHORDS
         const measuresToSkip = Math.floor((noteStartTickAdjusted + TICK_TOLERANCE_FOR_CHORDS) / ticksPerMeasure);
 
         for (let i = 0; i < measuresToSkip; i++) {
@@ -420,11 +419,10 @@ function generateVexflowJson(metadataFromBackend, allParsedNotesFromBackend) {
     measuresGroupedAll.forEach((measureNotesOriginal, measureIndex) => {
         const startTickOfMeasure = measureIndex * ticksPerMeasure;
 
-        // --- NUOVA LOGICA: Raggruppa per accordo e assegna l'intero accordo a un rigo ---
         const measureChordGroups = groupNotesByTick(measureNotesOriginal, TICK_TOLERANCE_FOR_CHORDS);
 
-        const currentMeasureNotesTreble = [];
-        const currentMeasureNotesBass = [];
+        const currentMeasureChordGroupsTreble = [];
+        const currentMeasureChordGroupsBass = [];
 
         measureChordGroups.forEach(chordGroup => {
              if (chordGroup.length === 0) return;
@@ -435,22 +433,15 @@ function generateVexflowJson(metadataFromBackend, allParsedNotesFromBackend) {
 
              const targetStave = (lowestNote && lowestNote.midi >= NOTE_SPLIT_POINT) ? 'treble' : 'bass';
 
-             // Aggiungi l'intero gruppo (l'accordo) alla lista delle note per il rigo target
-             // Non aggiungiamo le note individuali, ma il gruppo per mantenerle unite.
-             // processStaveNotesAndRests si aspetta un array di gruppi di note.
              if (targetStave === 'treble') {
-                 currentMeasureNotesTreble.push(chordGroup);
+                 currentMeasureChordGroupsTreble.push(chordGroup);
              } else {
-                 currentMeasureNotesBass.push(chordGroup);
+                 currentMeasureChordGroupsBass.push(chordGroup);
              }
         });
-        // --- FINE NUOVA LOGICA ---
 
-
-        // Processa i gruppi di accordi per creare tickables.
-        // processStaveNotesAndRests ora si aspetta una lista di gruppi di note (accordi).
-        const trebleTickablesVex = processStaveNotesAndRests(currentMeasureNotesTreble, "treble", ticksPerMeasure, startTickOfMeasure, measureIndex, ppq);
-        const bassTickablesVex = processStaveNotesAndRests(currentMeasureNotesBass, "bass", ticksPerMeasure, startTickOfMeasure, measureIndex, ppq);
+        const trebleTickablesVex = processStaveNotesAndRests(currentMeasureChordGroupsTreble, "treble", ticksPerMeasure, startTickOfMeasure, measureIndex, ppq);
+        const bassTickablesVex = processStaveNotesAndRests(currentMeasureChordGroupsBass, "bass", ticksPerMeasure, startTickOfMeasure, measureIndex, ppq);
 
 
         vexflowMeasures.push({
@@ -497,8 +488,12 @@ function generateVexflowJson(metadataFromBackend, allParsedNotesFromBackend) {
     };
 }
 
-async function drawMusicSheetFromJson(vexflowData) {
+async function drawMusicSheetFromJson(vexflowDataInput) {
     console.log("[DRAW] Inizio disegno partitura...");
+
+    // Salva i dati VexFlow generati globalmente per l'esportazione
+    vexflowData = vexflowDataInput;
+
 
     if (!vexflowData || !vexflowData.measures?.length) {
         console.error("[DRAW] Dati JSON non validi o misure mancanti per il disegno.");
@@ -521,7 +516,6 @@ async function drawMusicSheetFromJson(vexflowData) {
     setupRenderer();
 
     const timeSig = vexflowData.metadata.timeSignature;
-    // const keySig = vexflowData.metadata.keySignature; // Non usiamo più l'armatura di chiave qui
     const totalMeasures = vexflowData.measures.length;
 
     const totalLines = Math.ceil(totalMeasures / MEASURES_PER_LINE);
@@ -688,6 +682,9 @@ async function handleFileSelect(event) {
         if (statusDisplay) statusDisplay.textContent = "Carica un file MIDI.";
         setupRenderer();
         accuracyDisplay.textContent = "Accuratezza: N/A";
+        // Pulisci i dati globali se nessun file selezionato
+        allParsedNotesFromBackend = [];
+        vexflowData = null;
         return;
     }
 
@@ -701,8 +698,13 @@ async function handleFileSelect(event) {
         if (reader.error) {
              console.error("[FILE] Errore lettura file:", reader.error);
              alert("Impossibile leggere il file selezionato.");
-             container.innerHTML = '<p>Errore lettura file.</p>';
+             container.innerHTML = '<p>Erro lettura file.</p>';
              if(statusDisplay) statusDisplay.textContent = "Erro lettura file.";
+             // Pulisci i dati globali in caso di errore
+             allParsedNotesFromBackend = [];
+             vexflowData = null;
+             disableButtons(); // Assicura che i pulsanti siano disabilitati in caso di errore
+             accuracyDisplay.textContent = "Accuratezza: N/A";
              return;
         }
 
@@ -728,20 +730,30 @@ async function handleFileSelect(event) {
             const backendData = await response.json();
             console.log("[FILE] Risposta JSON ricevuta con successo.");
 
-            const allParsedNotes = backendData.allParsedNotes || [];
+            // Salva i dati raw dal backend globalmente
+            allParsedNotesFromBackend = backendData.allParsedNotes || [];
              if (!backendData.metadata) {
                  console.warn("[FILE] Metadati mancanti nella risposta backend.");
                  backendData.metadata = {};
              }
-            console.log(`[FILE] Ricevute ${allParsedNotes.length} note individuali dal backend.`);
+             // Salva i metadati globalmente
+             vexflowData = { metadata: backendData.metadata, measures: [] }; // Inizializza con solo metadata
 
-            vexflowData = generateVexflowJson(backendData.metadata, allParsedNotes);
+            console.log(`[FILE] Ricevute ${allParsedNotesFromBackend.length} note individuali dal backend.`);
 
-            if (vexflowData && vexflowData.measures?.length > 0) {
+            // Genera la struttura dati per VexFlow (e popola vexflowData.measures)
+            const generatedVexflowData = generateVexflowJson(vexflowData.metadata, allParsedNotesFromBackend);
+
+            if (generatedVexflowData && generatedVexflowData.measures?.length > 0) {
+                 // Aggiorna i measures nei dati globali
+                 vexflowData.measures = generatedVexflowData.measures;
+
                  console.log("[FILE] Generazione VexFlow JSON completata. Disegno partitura...");
-                drawMusicSheetFromJson(vexflowData);
+                drawMusicSheetFromJson(vexflowData); // Disegna basato sui dati generati
+
+
             } else {
-                 const message = allParsedNotes.length === 0 ? "Il file MIDI non contiene note valide per il disegno." : "Errore durante la preparazione dei dati per il disegno. Controlla la console.";
+                 const message = allParsedNotesFromBackend.length === 0 ? "Il file MIDI non contiene note valide per il disegno." : "Errore durante la preparazione dei dati per il disegno. Controlla la console.";
                  alert(message);
                  container.innerHTML = `<p>${message}</p>`;
                  if(statusDisplay) statusDisplay.textContent = message;
@@ -755,6 +767,9 @@ async function handleFileSelect(event) {
             alert(`Si è verificato un errore durante l'elaborazione del file: ${error.message}. Controlla la console.`);
             container.innerHTML = `<p>Errore: ${error.message}</p>`;
             if(statusDisplay) statusDisplay.textContent = `Errore: ${error.message}`;
+             // Pulisci i dati globali in caso di errore
+             allParsedNotesFromBackend = [];
+             vexflowData = null;
             disableButtons();
              accuracyDisplay.textContent = "Accuratezza: N/A";
         }
@@ -884,7 +899,7 @@ function handleUserNoteInput(midiNumber) {
             correctNotesCount++;
             updateAccuracyDisplay();
 
-             const svgElement = svgElementsMap.get(expectedNote.vexflowTickable.originalNotes[0].id);
+             const svgElement = svgElementsMap.get(expectedNote.originalNotes[0].id);
              if (svgElement) {
                  svgElement.classList.remove('current-note-highlight');
                  svgElement.classList.add('correct-note');
@@ -905,7 +920,7 @@ function handleUserNoteInput(midiNumber) {
 
         } else {
             console.log(`[INPUT] Errato. Suonata nota MIDI ${midiNumber}, attesa una tra ${chordNotes.map(n => n.midi).join(', ')}.`);
-            flashIncorrectNote(expectedNote.vexflowTickable.originalNotes[0]);
+            flashIncorrectNote(expectedNote.originalNotes[0]);
         }
     } else {
          console.log(`[INPUT] Input MIDI ${midiNumber} ricevuto, ma esercizio non attivo.`);
@@ -916,6 +931,7 @@ function enableButtons() {
     if (playButton) playButton.disabled = false;
     if (stopButton) stopButton.disabled = false;
      if (exportPngButton && container.querySelector('svg')) exportPngButton.disabled = false;
+     if (exportExerciseButton) exportExerciseButton.disabled = false; // Abilita il pulsante di esportazione
      if (speedSlider) speedSlider.disabled = false;
 }
 
@@ -923,6 +939,7 @@ function disableButtons() {
     if (playButton) playButton.disabled = true;
     if (stopButton) stopButton.disabled = true;
     if (exportPngButton) exportPngButton.disabled = true;
+    if (exportExerciseButton) exportExerciseButton.disabled = true; // Disabilita il pulsante di esportazione
     if (speedSlider) speedSlider.disabled = true;
 }
 
@@ -1020,9 +1037,211 @@ async function exportPentagrammaAsPNG() {
     }
 }
 
+
+// --- NUOVA FUNZIONE: Esporta dati esercizio in formato .js ---
+function exportExerciseData() {
+    console.log("[EXPORT DATA] Inizio esportazione dati esercizio...");
+
+    if (!allParsedNotesFromBackend || allParsedNotesFromBackend.length === 0 || !vexflowData || !vexflowData.metadata) {
+        console.warn("[EXPORT DATA] Nessun dato analizzato disponibile per l'esportazione.");
+        alert("Carica un file MIDI e attendi l'analisi prima di esportare i dati dell'esercizio.");
+        return;
+    }
+
+    try {
+        const rawNotes = [...allParsedNotesFromBackend]; // Copia i dati raw originali
+
+        const timeSig = vexflowData.metadata.timeSignature || "4/4";
+        const keySig = vexflowData.metadata.keySignature || "C"; // Usa la keySig dal backend (anche se non disegnata)
+        const ppq = vexflowData.metadata.ppq || 480;
+        const [beats, unit] = timeSig.split('/').map(Number);
+        const ticksPerMeasure = (ppq * (4 / unit)) * beats;
+
+        // Raggruppa le note raw per misura e poi per accordo
+        const measuresGroupedAll = groupNotesByMeasure(rawNotes, [beats, unit], ppq);
+
+        const notesTrebleExport = [];
+        const notesBassExport = [];
+
+        let measureCounter = 0; // Usa un contatore per le misure reali (saltando quelle iniziali vuote per l'export?)
+        // Decidiamo di includere tutte le misure, anche vuote, per mantenere la struttura temporale
+
+        measuresGroupedAll.forEach((measureNotesOriginal, measureIndex) => {
+             // Ignora le misure completamente vuote all'inizio per l'export?
+             // O le includiamo per mantenere la struttura? Includiamole per ora.
+             // if (measureIndex > 0 && measureNotesOriginal.length === 0 && measuresGroupedAll[measureIndex - 1].length === 0) {
+             //     // Salta misure vuote consecutive dopo la prima? O solo all'inizio?
+             //     // Manteniamo tutte le misure per ora.
+             // }
+
+            const measureChordGroups = groupNotesByTick(measureNotesOriginal, TICK_TOLERANCE_FOR_CHORDS);
+
+            // Separa gli accordi/gruppi di note per mano usando la regola della nota più bassa
+            const currentMeasureChordGroupsTreble = [];
+            const currentMeasureChordGroupsBass = [];
+
+            measureChordGroups.forEach(chordGroup => {
+                 if (chordGroup.length === 0) return;
+
+                 const lowestNote = chordGroup.reduce((minNote, currentNote) => {
+                     return (minNote === null || currentNote.midi < minNote.midi) ? currentNote : minNote;
+                 }, null);
+
+                 const targetStave = (lowestNote && lowestNote.midi >= NOTE_SPLIT_POINT) ? 'treble' : 'bass';
+
+                 if (targetStave === 'treble') {
+                     currentMeasureChordGroupsTreble.push(chordGroup);
+                 } else {
+                     currentMeasureChordGroupsBass.push(chordGroup);
+                 }
+            });
+
+            // --- Aggiungi le pause di misura intera per i righi vuoti anche nell'export ---
+            if (currentMeasureChordGroupsTreble.length === 0) {
+                 // Aggiungi una pausa di misura intera concettuale alla lista di esportazione se il rigo Treble è vuoto
+                 const restTicks = ticksPerMeasure;
+                 const { duration: restDurationStr, dots: restDots } = ticksToVexflowDuration(restTicks);
+                 if (restDurationStr && restDurationStr !== "0") {
+                     // Creiamo un oggetto che rappresenti una pausa di misura intera nel formato target
+                     const restExportFormat = { keys: ["b/4"], duration: restDurationStr + "r", midiValue: -1 }; // midiValue -1 per rests
+                     // Aggiungi dots se necessario
+                     if (restDots > 0) { restExportFormat.dots = restDots; } // Aggiungi dots se presenti
+                     notesTrebleExport.push(restExportFormat);
+                 } else {
+                      console.warn(`[EXPORT DATA] Impossibile creare pausa di misura intera per Treble misura ${measureIndex + 1} con ${restTicks} ticks.`);
+                 }
+            } else {
+                 // Per il rigo Treble con note, aggiungi le note/accordi nel formato export
+                 currentMeasureChordGroupsTreble.forEach(chordGroup => {
+                     // Trova la durata più corta nell'accordo per il rendering
+                     let shortestDurationQLInChord = Infinity;
+                     chordGroup.forEach(note => {
+                         const noteDurationQL = note.durationTicks / ppq;
+                         if (noteDurationQL > 0 && noteDurationQL < shortestDurationQLInChord) {
+                             shortestDurationQLInChord = noteDurationQL;
+                         }
+                     });
+                      if (shortestDurationQLInChord <= 0 || shortestDurationQLInChord === Infinity) {
+                          shortestDurationQLInChord = MIN_REST_TICKS / ppq;
+                      }
+                     const tempChordTicks = shortestDurationQLInChord * ppq;
+                     const { duration, dots } = ticksToVexflowDuration(tempChordTicks);
+
+
+                     const chordExportFormat = {
+                         keys: chordGroup.map(n => {
+                             // Formatta la chiave come "nota/ottava" per il campo keys
+                             const fullName = n.noteNameWithOctave;
+                             if (!fullName) return midiNumberToVexflowNote(n.midi); // Fallback
+                             const match = fullName.match(/^([A-G])(?:#|-|n)?(\d+)$/i); // Ignora alterazione qui
+                             if (!match || match.length !== 3) return midiNumberToVexflowNote(n.midi); // Fallback
+                             return `${match[1].toLowerCase()}/${match[2]}`;
+                         }),
+                         duration: duration, // Durata dell'accordo (la più corta)
+                         midiValue: chordGroup.map(n => n.midi), // Array di valori MIDI per l'accordo
+                         // Accidental non è nel formato di export degli esercizi
+                     };
+                     if (dots > 0) { chordExportFormat.dots = dots; } // Aggiungi dots se presenti
+
+                     notesTrebleExport.push(chordExportFormat);
+                 });
+            }
+
+             // Ripeti la logica per il rigo Bass
+             if (currentMeasureChordGroupsBass.length === 0) {
+                 // Aggiungi una pausa di misura intera concettuale alla lista di esportazione se il rigo Bass è vuoto
+                 const restTicks = ticksPerMeasure;
+                 const { duration: restDurationStr, dots: restDots } = ticksToVexflowDuration(restTicks);
+                 if (restDurationStr && restDurationStr !== "0") {
+                     const restExportFormat = { keys: ["d/3"], duration: restDurationStr + "r", midiValue: -1 };
+                     if (restDots > 0) { restExportFormat.dots = restDots; }
+                     notesBassExport.push(restExportFormat);
+                 } else {
+                      console.warn(`[EXPORT DATA] Impossibile creare pausa di misura intera per Bass misura ${measureIndex + 1} con ${restTicks} ticks.`);
+                 }
+            } else {
+                 // Per il rigo Bass con note, aggiungi le note/accordi nel formato export
+                 currentMeasureChordGroupsBass.forEach(chordGroup => {
+                     let shortestDurationQLInChord = Infinity;
+                     chordGroup.forEach(note => {
+                         const noteDurationQL = note.durationTicks / ppq;
+                         if (noteDurationQL > 0 && noteDurationQL < shortestDurationQLInChord) {
+                             shortestDurationQLInChord = noteDurationQL;
+                         }
+                     });
+                      if (shortestDurationQLInChord <= 0 || shortestDurationQLInChord === Infinity) {
+                          shortestDurationQLInChord = MIN_REST_TICKS / ppq;
+                      }
+                     const tempChordTicks = shortestDurationQLInChord * ppq;
+                     const { duration, dots } = ticksToVexflowDuration(tempChordTicks);
+
+                     const chordExportFormat = {
+                         keys: chordGroup.map(n => {
+                             const fullName = n.noteNameWithOctave;
+                             if (!fullName) return midiNumberToVexflowNote(n.midi);
+                             const match = fullName.match(/^([A-G])(?:#|-|n)?(\d+)$/i);
+                             if (!match || match.length !== 3) return midiNumberToVexflowNote(n.midi);
+                             return `${match[1].toLowerCase()}/${match[2]}`;
+                         }),
+                         duration: duration,
+                         midiValue: chordGroup.map(n => n.midi),
+                     };
+                      if (dots > 0) { chordExportFormat.dots = dots; }
+
+                     notesBassExport.push(chordExportFormat);
+                 });
+            }
+        });
+
+        // Costruisci l'oggetto finale nel formato degli esercizi
+        const exerciseData = {
+            id: `midi-export-${Date.now()}`, // ID univoco basato sul timestamp
+            name: `Esportato da MIDI - ${fileInput.files[0]?.name || 'Unknown'}`, // Nome basato sul file originale
+            category: "midi_export",
+            staveLayout: "grand", // Assumiamo sempre Grand Staff per ora
+            keySignature: keySig, // Usa la Key Signature dal backend
+            timeSignature: timeSig, // Usa la Time Signature dal backend
+            repetitions: 1, // Default 1 ripetizione
+            notesTreble: notesTrebleExport,
+            notesBass: notesBassExport,
+            ppq: ppq // Includi PPQ nei dati per riferimento se necessario
+        };
+
+        // Converti l'oggetto in una stringa JavaScript formattata
+        // Iniziamo con l'intestazione della variabile
+        let jsString = `/**\n * Dati esercizio esportati da Midigram.\n */\n\n`;
+        jsString += `const exportedExerciseData = ${JSON.stringify(exerciseData, null, 4)};`; // Usa JSON.stringify con indentazione
+
+        // Crea un Blob e un link per il download
+        const blob = new Blob([jsString], { type: 'text/javascript' });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+
+        link.href = url;
+        link.download = `exercise_export_${Date.now()}.js`; // Nome file con timestamp
+
+        document.body.appendChild(link);
+        link.click();
+
+        document.body.removeChild(link);
+        URL.revokeObjectURL(url); // Pulisci l'URL dell'oggetto Blob
+
+        console.log("[EXPORT DATA] Esportazione completata.");
+        if(statusDisplay) statusDisplay.textContent = "Dati esercizio esportati (.js).";
+
+    } catch (e) {
+        console.error("[EXPORT DATA] Errore durante l'esportazione dei dati esercizio:", e);
+        alert("Errore durante l'esportazione dei dati dell'esercizio.");
+        if(statusDisplay) statusDisplay.textContent = "Erro esportazione dati esercizio.";
+    }
+}
+
+// --- Fine NUOVA FUNZIONE ---
+
+
 function init() {
     console.log("[INIT] Inizializzazione...");
-    if (!container || !fileInput || !statusDisplay || !playButton || !stopButton || !exportPngButton || !speedSlider || !speedValueSpan || !accuracyDisplay) {
+    if (!container || !fileInput || !statusDisplay || !playButton || !stopButton || !exportPngButton || !exportExerciseButton || !speedSlider || !speedValueSpan || !accuracyDisplay) {
         console.error("Elementi UI principali non trovati!");
         alert("Errore interfaccia. Ricarica la pagina.");
         disableButtons();
@@ -1030,27 +1249,43 @@ function init() {
     }
 
     setupRenderer();
-    disableButtons();
+    disableButtons(); // Disabilita i pulsanti all'avvio
 
+    // Aggiunge listener per la selezione file
     fileInput.addEventListener('change', handleFileSelect, false);
+
+    // Aggiunge listener per i pulsanti
     playButton.addEventListener('click', startPlayback);
     stopButton.addEventListener('click', stopPlayback);
     exportPngButton.addEventListener('click', exportPentagrammaAsPNG);
+    exportExerciseButton.addEventListener('click', exportExerciseData); // Listener per il nuovo pulsante
 
+    // Aggiunge listener per lo slider di velocità (aggiorna solo il display per ora)
     speedSlider.addEventListener('input', (event) => {
          updateSpeedDisplay(event.target.value);
     });
-     updateSpeedDisplay(speedSlider.value);
+     updateSpeedDisplay(speedSlider.value); // Imposta il testo iniziale dello slider
 
+    // Listener per l'input MIDI simulato (puoi collegare qui la tua tastiera MIDI reale)
+    // Esempio: Gestore eventi da un modulo MIDI o un'altra fonte
+    // window.addEvent...('midiinput', handleUserNoteInput);
+    // Per test, possiamo simulare un input utente con un ritardo dopo il click su una nota disegnata
+    // Questo richiede un mapping SVG -> Note Data (complesso in VexFlow 4.x)
+    // Implementazione alternativa: un semplice listener click sul container SVG che prova a
+    // identificare la nota cliccata (anch'esso euristico).
+
+    // Implementazione temporanea: funzione fittizia per simulare l'input MIDI
     window.simulateMidiInput = (midiNumber) => {
          handleUserNoteInput(midiNumber);
     };
     console.log("DEBUG: Puoi simulare input MIDI chiamando simulateMidiInput(midiNumber) nella console.");
 
+
     if(statusDisplay) statusDisplay.textContent = "Carica un file MIDI.";
     console.log("[INIT] Inizializzazione completata.");
 }
 
+// Avvio Applicazione quando il DOM è pronto
 if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', init);
 } else {
