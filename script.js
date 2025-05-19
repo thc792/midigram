@@ -1,335 +1,1056 @@
-// --- VexFlow Setup ---
+/*
+Copyright © 2024 lorenzetti giuseppe. All rights reserved.
+*/
+
 const { Renderer, Stave, StaveNote, Beam, Formatter, StaveConnector, Voice, Accidental, Dot, TickContext, Barline } = Vex.Flow;
 const VF = Vex.Flow;
 
-// --- Elementi DOM ---
+let renderer = null;
+let context = null;
+
 const container = document.getElementById('pentagramma-container');
 const fileInput = document.getElementById('midi-file-input');
-const accuracyDisplay = document.getElementById('accuracy-display');
+const statusDisplay = document.getElementById('playback-status');
 const playButton = document.getElementById('play-button');
 const stopButton = document.getElementById('stop-button');
-const playbackStatus = document.getElementById('playback-status');
-const exportPngButton = document.getElementById('export-png-button'); // <<< NUOVO
+const exportPngButton = document.getElementById('export-png-button');
+const speedSlider = document.getElementById('speed-slider');
+const speedValueSpan = document.getElementById('speed-value');
+const accuracyDisplay = document.getElementById('accuracy-display');
 
-// --- Costanti Configurabili ---
-const STAVE_WIDTH = 280; // <<< RIDOTTO per fare spazio a 4 battute
-const MEASURES_PER_LINE = 4; // <<< AUMENTATO a 4 battute per riga
+const STAVE_WIDTH = 280;
+const MEASURES_PER_LINE = 4;
 const STAVE_VERTICAL_SPACING = 120;
 const SYSTEM_VERTICAL_SPACING = 250;
 const STAVE_START_X = 15;
-const NOTE_SPLIT_POINT = 60; // Middle C
+const NOTE_SPLIT_POINT = 60;
+const TICK_TOLERANCE_FOR_CHORDS = 5;
+const MIN_REST_TICKS = 1;
 
-// --- Stato Applicazione ---
-let midiAccess = null; let parsedMidi = null; let vexflowJsonData = null;
-let allParsedNotes = [];         // Array originale completo { id, midi, ticks, ..., played }
-let trebleNotes = [];            // Array note solo Treble, ordinate per tick
-let bassNotes = [];              // Array note solo Bass, ordinate per tick
-let vexflowNotesMap = new Map(); // ID -> Oggetto VexNote
-let svgElementMap = new Map();   // ID -> Elemento SVG
+let ppq = 480;
+let vexflowData = null;
+let playbackInterval = null;
+let currentNoteIndex = -1;
+let allParsedNotesFlattened = [];
+let svgElementsMap = new Map();
+let userNoteInputListener = null;
+let lastUserMidiInput = null;
+let totalNotesInExercise = 0;
+let correctNotesCount = 0;
 
-// --- Stato per Flussi Indipendenti ---
-let nextTrebleNoteIndex = 0;     // Indice prossima nota attesa in trebleNotes
-let nextBassNoteIndex = 0;       // Indice prossima nota attesa in bassNotes
-let activeTrebleNoteID = null;   // ID nota attiva Treble
-let activeBassNoteID = null;     // ID nota attiva Bass
+function ticksToVexflowDuration(ticks) {
+    const q = ppq;
+    if (q <= 0 || ticks < MIN_REST_TICKS) {
+         return { duration: "0", dots: 0 };
+    }
 
-// --- Stato Generale ---
-let correctNotesCount = 0; let totalNotesInSong = 0; let renderer = null; let context = null; let ppq = 480;
-let midiTempo = 500000; // Memorizza tempo letto dal MIDI (microsec per quarter note)
+    const durationMap = [
+        { ticks: q * 4, duration: "w", dots: 0 },
+        { ticks: q * 3, duration: "h", dots: 1 },
+        { ticks: q * 2, duration: "h", dots: 0 },
+        { ticks: q * 1.5, duration: "q", dots: 1 },
+        { ticks: q * 1, duration: "q", dots: 0 },
+        { ticks: q * 0.75, duration: "8", dots: 1 },
+        { ticks: q * 0.5, duration: "8", dots: 0 },
+        { ticks: q * 0.375, duration: "16", dots: 1 },
+        { ticks: q * 0.25, duration: "16", dots: 0 },
+        { ticks: q * 0.125, duration: "32", dots: 0 },
+        { ticks: q * 0.0625, duration: "64", dots: 0 }
+    ];
 
-// --- Stato Playback Audio/Visuale ---
-let audioCtx = null; // Web Audio Context
-let isPlaying = false; // Flag per playback
-let scheduledVisuals = []; // Array per ID timeout visuali (per stop)
-let activeOscillators = []; // Array per riferimenti agli oscillatori (per stop)
-let masterGainNode = null; // Nodo Gain principale per controllo volume/stop
+    const tolerance = ppq * 0.02;
 
+    for (const map of durationMap) {
+        if (Math.abs(ticks - map.ticks) < tolerance) {
+            return { duration: map.duration, dots: map.dots };
+        }
+    }
 
-// --- Funzioni Utilità (ticksToVexflowDuration, midiNumberToVexflowNote, groupNotesByMeasure) ---
-function ticksToVexflowDuration(ticks) { const q = ppq; if (q <= 0) return { duration: "16", dots: 0 }; const t = 0.90; if (ticks >= q*4*t) return { duration: "w", dots: 0 }; if (ticks >= q*3*t) return { duration: "h", dots: 1 }; if (ticks >= q*2*t) return { duration: "h", dots: 0 }; if (ticks >= q*1.5*t) return { duration: "q", dots: 1 }; if (ticks >= q*1*t) return { duration: "q", dots: 0 }; if (ticks >= q*0.75*t) return { duration: "8", dots: 1 }; if (ticks >= q*0.5*t) return { duration: "8", dots: 0 }; if (ticks >= q*0.375*t) return { duration: "16", dots: 1 }; if (ticks >= q*0.25*t) return { duration: "16", dots: 0 }; if (ticks >= q*0.125*t) return { duration: "32", dots: 0 }; return { duration: "16", dots: 0 }; }
-function midiNumberToVexflowNote(midiNumber) { const n = ["c","c#","d","d#","e","f","f#","g","g#","a","a#","b"]; const o = Math.floor(midiNumber / 12) - 1; const i = midiNumber % 12; return `${n[i]}/${o}`; }
-function groupNotesByMeasure(notes, timeSignature, ppqInput) { if (!timeSignature || !Array.isArray(timeSignature) || timeSignature.length < 2 || !ppqInput || ppqInput <= 0) { timeSignature = [4, 4]; ppqInput = 480; } let [beats, unit] = timeSignature; if (typeof unit !== 'number' || unit <= 0 || Math.log2(unit) % 1 !== 0) { unit = 4; } const ticksPerBeat = ppqInput * (4 / unit); const ticksPerMeasure = ticksPerBeat * beats; if (ticksPerMeasure <= 0) { return [notes]; } const measures = []; let currentNotes = []; let currentIdx = 0; notes.forEach(note => { const epsilon = 1; const noteStartIdx = Math.floor((note.ticks + epsilon) / ticksPerMeasure); while (currentIdx < noteStartIdx) { measures.push(currentNotes); currentNotes = []; currentIdx++; } currentNotes.push(note); }); measures.push(currentNotes); return measures; }
+    let bestMatch = { duration: "32", dots: 0 };
+    let minDiff = Infinity;
 
-// --- Conversione da Struttura MidiParser a JSON per VexFlow ---
-function convertMidiDataToJson(parsedMidiData) {
-    if (!parsedMidiData || !parsedMidiData.track) { console.error("[CONVERT] Dati MidiParser non validi."); return null; }
-    let timeSig = [4, 4], keySig = "C", localPpq = 480, tempo = 500000; if (typeof parsedMidiData.timeDivision === 'number' && parsedMidiData.timeDivision > 0) localPpq = parsedMidiData.timeDivision; else if (Array.isArray(parsedMidiData.timeDivision)) console.warn("[CONVERT] Modalità SMPTE rilevata."); ppq = localPpq;
-    if (parsedMidiData.track[0]?.event) { for (const event of parsedMidiData.track[0].event) { if (event.type === 0xFF) { if (event.metaType === 0x58 && event.data?.length >= 2) { const d = Math.pow(2, event.data[1]); if (d > 0) timeSig = [event.data[0], d]; } else if (event.metaType === 0x59) keySig = "C"; else if (event.metaType === 0x51 && typeof event.data === 'number') tempo = event.data; } } }
-    midiTempo = tempo; // Salva tempo per playback
-    const timeSigStr = `${timeSig[0]}/${timeSig[1]}`; let ticks = 0; const notesInProgress = {}; const finishedNotes = [];
-    parsedMidiData.track.forEach((track, trackIndex) => {
-        ticks = 0;
-        track.event.forEach((event, eventIndex) => {
-            ticks += event.deltaTime; const type = event.type; const ch = event.channel;
-            if (type === 9 && event.data?.[1] > 0) { const note = event.data[0], vel = event.data[1], key = `${ch}_${note}`, id = `vf-t${trackIndex}-e${eventIndex}-m${note}`; if (notesInProgress[key]) delete notesInProgress[key]; notesInProgress[key] = { note: { id, midi: note, ticks, durationTicks: 0, vexNoteName: midiNumberToVexflowNote(note), track: trackIndex, channel: ch, velocity: vel }, startTime: ticks }; }
-            else if (type === 8 || (type === 9 && event.data?.[1] === 0)) { const note = event.data[0], key = `${ch}_${note}`; if (notesInProgress[key]) { const finNote = notesInProgress[key]; finNote.note.durationTicks = ticks - finNote.startTime; if (finNote.note.durationTicks > 0) finishedNotes.push(finNote.note); else console.warn(`[PARSE] Nota ${finNote.note.id} scartata (durata <= 0).`); delete notesInProgress[key]; } }
-        });
-        Object.keys(notesInProgress).forEach(key => { if (notesInProgress[key]?.note.track === trackIndex) { console.warn(`[PARSE] Nota ${key} (ID: ${notesInProgress[key].note.id}) appesa. Ignorata.`); delete notesInProgress[key]; } });
+    for (const map of durationMap) {
+        const diff = Math.abs(ticks - map.ticks);
+        if (diff < minDiff) {
+            minDiff = diff;
+            bestMatch = { duration: map.duration, dots: map.dots };
+        }
+    }
+
+     if (ticks > 0 && bestMatch.ticks > ticks * 2 && ticks < ppq * 0.1) {
+         console.warn(`[ticksToVexflowDuration] Durata molto corta (${ticks} ticks) mappata a ${bestMatch.duration} (${bestMatch.ticks} ticks) con diff ${minDiff}. Misura PPQ: ${q}.`);
+     } else if (ticks > 0 && minDiff > tolerance * 2) {
+          console.warn(`[ticksToVexflowDuration] Nessun match entro tolleranza ${tolerance} per ${ticks} ticks. Miglior match: ${bestMatch.duration} (${bestMatch.ticks} ticks) con diff ${minDiff}. Misura PPQ: ${q}.`);
+     }
+
+    return bestMatch;
+}
+
+function midiNumberToVexflowNote(midiNumber) {
+    const n = ["c","c#","d","d#","e","f","f#","g","g#","a","a#","b"];
+    const o = Math.floor(midiNumber / 12) - 1;
+    const i = midiNumber % 12;
+    return `${n[i]}/${o}`;
+}
+
+function groupNotesByMeasure(notes, timeSignature, ppqInput) {
+    if (!timeSignature || timeSignature.length < 2 || !ppqInput || ppqInput <= 0) {
+        console.warn("[groupNotesByMeasure] TimeSignature o PPQ non validi. Uso default 4/4 @ 480 PPQ.");
+        timeSignature = [4, 4];
+        ppqInput = 480;
+    }
+    let [beats, unit] = timeSignature;
+    if (typeof unit !== 'number' || unit <= 0 || (Math.log2(unit) % 1 !== 0 && unit !== 1)) {
+        console.warn(`[groupNotesByMeasure] Unità TimeSignature (${unit}) non valida. Uso default 4.`);
+        unit = 4;
+    }
+
+    const ticksPerBeat = ppqInput * (4 / unit);
+    const ticksPerMeasure = ticksPerBeat * beats;
+
+    if (ticksPerMeasure <= 0) {
+        console.warn("[groupNotesByMeasure] TicksPerMeasure non valido o zero. Gruppo tutte le note in una misura.", { timeSignature, ppqInput, ticksPerMeasure });
+         if (notes.length > 0) {
+             return [notes];
+         } else {
+             return [[]];
+         }
+    }
+
+    const measures = [];
+    let currentNotes = [];
+    let currentMeasureStartTick = 0;
+
+    notes.sort((a, b) => a.ticks - b.ticks || a.midi - b.midi);
+
+    if (notes.length > 0 && notes[0].ticks > TICK_TOLERANCE_FOR_CHORDS) {
+        // CORREZIONE QUI: TICK_TICK_TOLERANCE_FOR_CHORDS -> TICK_TOLERANCE_FOR_CHORDS
+        let initialEmptyMeasures = Math.floor((notes[0].ticks - TICK_TOLERANCE_FOR_CHORDS) / ticksPerMeasure);
+        if (initialEmptyMeasures < 0) initialEmptyMeasures = 0;
+
+        for (let i = 0; i < initialEmptyMeasures; i++) {
+            measures.push([]);
+        }
+         currentMeasureStartTick = initialEmptyMeasures * ticksPerMeasure;
+         console.log(`[groupNotesByMeasure] Aggiunte ${initialEmptyMeasures} misure vuote iniziali.`);
+    } else if (notes.length === 0) {
+         measures.push([]);
+         console.log("[groupNotesByMeasure] Nessuna note trovata. Aggiunta una misura vuota.");
+         return measures;
+    } else {
+         console.log("[groupNotesByMeasure] La prima note inizia vicino a tick 0. Inizio con la prima misura popolata.");
+    }
+
+    notes.forEach(note => {
+        const noteStartTickAdjusted = note.ticks - currentMeasureStartTick;
+        // CORREZIONE QUI: TICK_TICK_TOLERANCE_FOR_CHORDS -> TICK_TOLERANCE_FOR_CHORDS
+        const measuresToSkip = Math.floor((noteStartTickAdjusted + TICK_TOLERANCE_FOR_CHORDS) / ticksPerMeasure);
+
+        for (let i = 0; i < measuresToSkip; i++) {
+             measures.push(currentNotes);
+             currentNotes = [];
+             currentMeasureStartTick += ticksPerMeasure;
+        }
+
+        currentNotes.push(note);
     });
-    finishedNotes.sort((a, b) => a.ticks - b.ticks); allParsedNotes = finishedNotes.map(n => ({ ...n, played: false })); console.log(`[CONVERT] Note MIDI estratte: ${allParsedNotes.length}`);
-    trebleNotes = allParsedNotes.filter(note => note.midi >= NOTE_SPLIT_POINT); bassNotes = allParsedNotes.filter(note => note.midi < NOTE_SPLIT_POINT); console.log(`[CONVERT] Note separate: Treble=${trebleNotes.length}, Bass=${bassNotes.length}`);
-    if (allParsedNotes.length === 0) { console.warn("[CONVERT] Nessuna nota valida."); return null; }
-    const measuresGrouped = groupNotesByMeasure(allParsedNotes, timeSig, localPpq); const vexflowJson = { metadata: { timeSignature: timeSigStr, keySignature: keySig, ppq: localPpq, tempo: midiTempo }, measures: [] };
-    measuresGrouped.forEach((measureNotes) => { const measureJson = { staves: { treble: [], bass: [] } }; measureNotes.forEach(note => { const { duration, dots } = ticksToVexflowDuration(note.durationTicks); const noteJson = { id: note.id, keys: [note.vexNoteName], duration, dots }; if (note.midi < NOTE_SPLIT_POINT) measureJson.staves.bass.push(noteJson); else measureJson.staves.treble.push(noteJson); }); vexflowJson.measures.push(measureJson); });
-    return vexflowJson;
+
+    if (currentNotes.length > 0) {
+        measures.push(currentNotes);
+    } else if (measures.length === 0 && notes.length > 0) {
+         console.warn("[groupNotesByMeasure] Nessuna misura generata nonostante la presenza di note dopo il loop. Ritorno note in singola misura finale.");
+         measures.push(notes);
+    } else if (measures.length === 0 && notes.length === 0) {
+         measures.push([]);
+         console.log("[groupNotesByMeasure] Nessuna nota e nessuna misura creata. Aggiunta una misura vuota finale.");
+    }
+
+    const cleanedMeasures = measures.filter(measure => measure !== null && measure !== undefined);
+
+     if (cleanedMeasures.length === 0 && notes.length >= 0) {
+         console.warn("[groupNotesByMeasure] Tutte le misure filtrate o non create. Aggiunta una misura vuota.");
+         return [[]];
+     }
+
+    return cleanedMeasures;
+}
+
+function groupNotesByTick(notesList, tolerance) {
+    const grouped = [];
+    if (!notesList || notesList.length === 0) return grouped;
+
+    notesList.sort((a, b) => a.ticks - b.ticks || a.midi - b.midi);
+
+    let i = 0;
+    while (i < notesList.length) {
+        const currentNote = notesList[i];
+        const chordGroup = [currentNote];
+        let j = i + 1;
+        while (j < notesList.length && Math.abs(notesList[j].ticks - currentNote.ticks) <= tolerance) {
+            chordGroup.push(notesList[j]);
+            j++;
+        }
+        chordGroup.sort((a, b) => a.midi - b.midi);
+        grouped.push(chordGroup);
+        i = j;
+    }
+    return grouped;
 }
 
 
-// --- Funzione di disegno VexFlow da JSON ---
-function drawMusicSheetFromJson(vexflowData) {
-    console.log("[DEBUG DRAW] Inizio disegno da JSON...");
-    setupRenderer(); if (!vexflowData || !vexflowData.measures?.length) { console.error("[DEBUG DRAW] Dati JSON non validi."); container.innerHTML = '<p>Errore dati.</p>'; return; }
-    const timeSig = vexflowData.metadata.timeSignature; const keySig = vexflowData.metadata.keySignature; const totalMeasures = vexflowData.measures.length;
-    // Usa le costanti aggiornate qui
+function processStaveNotesAndRests(chordGroupsForStave, staveType, ticksPerMeasure, startTickOfMeasure, measureIndex, ppqInput) {
+    const rawTickables = [];
+    const totalQLForMeasure = ticksPerMeasure / ppqInput;
+    const minRestQL = MIN_REST_TICKS / ppqInput;
+
+    if (chordGroupsForStave.length === 0) {
+        try {
+            const restTickable = new Vex.Flow.StaveNote({ keys: [staveType === "treble" ? "b/4" : "d/3"], duration: "Wr", clef: staveType });
+            rawTickables.push(restTickable);
+            console.log(`DEBUG REST: Added full measure rest to empty ${staveType} stave in measure ${measureIndex + 1}.`);
+        } catch (e) {
+            console.error(`Errore creazione Vex.Flow.StaveNote (Full Measure Rest) misura ${measureIndex + 1} ${staveType}:`, e);
+        }
+
+    } else {
+
+        let currentQLInMeasure = 0;
+
+        chordGroupsForStave.sort((a, b) => a[0].ticks - b[0].ticks);
+
+
+        chordGroupsForStave.forEach(chordGroup => {
+             if (chordGroup.length === 0) return;
+
+             const noteBase = chordGroup[0];
+
+            currentQLInMeasure = Math.max(currentQLInMeasure, (noteBase.ticks - startTickOfMeasure) / ppqInput - (TICK_TOLERANCE_FOR_CHORDS / ppqInput));
+
+
+            let shortestDurationQLInChord = Infinity;
+             if (chordGroup.length > 0) {
+                 shortestDurationQLInChord = chordGroup[0].durationTicks / ppqInput;
+                 chordGroup.forEach(note => {
+                      const noteDurationQL = note.durationTicks / ppqInput;
+                      if (noteDurationQL > 0 && noteDurationQL < shortestDurationQLInChord) {
+                          shortestDurationQLInChord = noteDurationQL;
+                      } else if (noteDurationQL <= 0) {
+                           console.warn(`[processaStaveNotesAndRests] Durata zero/negativa (${note.durationTicks} ticks) per nota ID ${note.id} in accordo. Ignorata per durata accordo.`);
+                      }
+                 });
+             }
+
+             if (shortestDurationQLInChord <= 0 || shortestDurationQLInChord === Infinity) {
+                 console.warn(`[processaStaveNotesAndRests] Durata effettiva zero/negativa per accordo a tick ${noteBase.ticks}. Imposto durata minima.`);
+                 shortestDurationQLInChord = MIN_REST_TICKS / ppqInput;
+             }
+
+
+            const tempChordTicks = shortestDurationQLInChord * ppqInput;
+            const { duration, dots } = ticksToVexflowDuration(tempChordTicks);
+
+            if (!duration || duration === "0") {
+                console.warn(`[processaStaveNotesAndRests] Durata convertita non valida "${duration}" per accordo a QL ${currentQLInMeasure.toFixed(2)}. Saltato disegno per gruppo:`, chordGroup.map(n => n.id));
+                 currentQLInMeasure += shortestDurationQLInChord;
+                 return;
+            }
+
+            const chordKeys = chordGroup.map(noteData => {
+                const fullName = noteData.noteNameWithOctave;
+                if (!fullName) {
+                    console.warn(`Note ID ${noteData.id} missing noteNameWithOctave. Falling back to midiNumberToVexflowNote.`);
+                    return midiNumberToVexflowNote(noteData.midi);
+                }
+
+                const match = fullName.match(/^([A-G](?:#|-|n)?)(\d+)$/i);
+                if (!match || match.length !== 3) {
+                     console.warn(`Could not parse noteNameWithOctave "${fullName}" into base note and octave for note ID ${noteData.id}. Falling back to midiNumberToVexflowNote.`);
+                     return midiNumberToVexflowNote(noteData.midi);
+                }
+
+                const baseNoteLetter = match[1].charAt(0).toLowerCase();
+                const octave = match[2];
+
+                const vexflowKey = `${baseNoteLetter}/${octave}`;
+
+                return vexflowKey;
+            });
+
+            const mainNoteForChord = chordGroup[0];
+
+            try {
+                const staveNoteOptions = { keys: chordKeys, duration: duration, clef: staveType };
+                staveNoteOptions.auto_stem = true;
+
+                const staveTickable = new Vex.Flow.StaveNote(staveNoteOptions);
+                staveTickable.originalNotes = chordGroup;
+
+
+                if (dots > 0) {
+                     for (let d = 0; d < dots; d++) {
+                        staveTickable.addModifier(new Vex.Flow.Dot(), 0);
+                     }
+                }
+
+                chordGroup.forEach((noteData, index) => {
+                    if (noteData.accidental) {
+                        try {
+                             staveTickable.addModifier(new Accidental(noteData.accidental), index);
+                        } catch (accError) {
+                             console.warn(`Errore aggiunta alterazione '${noteData.accidental}' a nota ID ${noteData.id} (misura ${measureIndex + 1}, ${staveType}, key index ${index}):`, accError);
+                        }
+                    }
+                });
+
+                rawTickables.push(staveTickable);
+
+                currentQLInMeasure += shortestDurationQLInChord;
+
+
+            } catch (e) {
+                console.error(`Errore creazione Vex.Flow.StaveNote (primo ID dati nel gruppo: ${mainNoteForChord ? mainNoteForChord.id : 'N/A'}) misura ${measureIndex + 1} ${staveType}:`, { keys: chordKeys, duration: duration, dots: dots, group: chordGroup }, e);
+                 currentQLInMeasure += shortestDurationQLInChord;
+            }
+        });
+    }
+
+    const finalTickables = [];
+    let currentBeamCandidates = [];
+
+    const isBeamableDuration = (tickable) => {
+        if (!(tickable instanceof Vex.Flow.StaveNote) || tickable.isRest()) return false;
+        const duration = tickable.getDuration();
+        return ['8', '16', '32', '64'].some(d => duration.startsWith(d));
+    };
+
+    const getLowestNoteMidi = (tickable) => {
+        const originalNotes = tickable.originalNotes;
+        return originalNotes && originalNotes.length > 0 ? originalNotes[0].midi : -1;
+    };
+
+
+    for (let k = 0; k < rawTickables.length; k++) {
+        const tickable = rawTickables[k];
+
+        if (isBeamableDuration(tickable)) {
+            if (currentBeamCandidates.length === 0) {
+                currentBeamCandidates.push(tickable);
+            } else {
+                const lastCandidate = currentBeamCandidates[currentBeamCandidates.length - 1];
+                const currentMidi = getLowestNoteMidi(tickable);
+                const lastMidi = getLowestNoteMidi(lastCandidate);
+
+                if (currentMidi !== -1 && lastMidi !== -1 && currentMidi < lastMidi) {
+                    currentBeamCandidates.push(tickable);
+                } else {
+                    if (currentBeamCandidates.length > 1) {
+                         finalTickables.push(new Vex.Flow.Beam(currentBeamCandidates));
+                    } else if (currentBeamCandidates.length === 1) {
+                        finalTickables.push(currentBeamCandidates[0]);
+                    }
+                    currentBeamCandidates = [tickable];
+                }
+            }
+        } else {
+             if (currentBeamCandidates.length > 1) {
+                 finalTickables.push(new Vex.Flow.Beam(currentBeamCandidates));
+             } else if (currentBeamCandidates.length === 1) {
+                  finalTickables.push(currentBeamCandidates[0]);
+             }
+            currentBeamCandidates = [];
+
+            finalTickables.push(tickable);
+        }
+    }
+
+    if (currentBeamCandidates.length > 1) {
+        finalTickables.push(new Vex.Flow.Beam(currentBeamCandidates));
+    } else if (currentBeamCandidates.length === 1) {
+        finalTickables.push(currentBeamCandidates[0]);
+    }
+
+    return finalTickables;
+}
+
+function convertMusic21KeyToVexflow(music21KeyName) {
+    if (!music21KeyName) return "C";
+
+    let vexflowKey = music21KeyName;
+
+    vexflowKey = vexflowKey.replace('-', 'b');
+
+    return vexflowKey;
+}
+
+
+function generateVexflowJson(metadataFromBackend, allParsedNotesFromBackend) {
+    console.log("[CONVERT] Inizio generazione VexFlow JSON...");
+
+    ppq = metadataFromBackend?.ppq || 480;
+    console.log(`[CONVERT] PPQ globale: ${ppq}`);
+
+    const notesToProcess = allParsedNotesFromBackend || [];
+    console.log(`[CONVERT] Note da processare: ${notesToProcess.length}`);
+
+    let timeSigStr = metadataFromBackend?.timeSignature || "4/4";
+    let [beats, unit] = timeSigStr.split('/').map(Number);
+    if (isNaN(beats) || isNaN(unit) || unit <= 0 || (Math.log2(unit) % 1 !== 0 && unit !== 1)) {
+         console.warn(`[CONVERT] TimeSig "${timeSigStr}" non valida. Uso default 4/4.`);
+         timeSigStr = "4/4"; beats = 4; unit = 4;
+         if (metadataFromBackend) { metadataFromBackend.timeSignature = timeSigStr; }
+    }
+    console.log(`[CONVERT] Usando TimeSig: ${timeSigStr}`);
+
+    const music21KeySig = metadataFromBackend?.keySignature || "C";
+    const keySigForVexFlow = convertMusic21KeyToVexflow(music21KeySig);
+    console.log(`[CONVERT] Usando KeySig per VexFlow: ${keySigForVexFlow} (convertito da music21: ${music21KeySig}).`);
+
+    const ticksPerBeat = ppq * (4 / unit);
+    const ticksPerMeasure = ticksPerBeat * beats;
+    console.log(`[CONVERT] Ticks per misura: ${ticksPerMeasure}`);
+     if (ticksPerMeasure <= 0) {
+         console.error("[CONVERT] Ticks per misura è zero o negativo. Impossibile generare VexFlow data.");
+         return null;
+     }
+
+    const measuresGroupedAll = groupNotesByMeasure(notesToProcess, [beats, unit], ppq);
+    console.log(`[CONVERT] Note raggruppate in ${measuresGroupedAll.length} misure.`);
+
+    const vexflowMeasures = [];
+    measuresGroupedAll.forEach((measureNotesOriginal, measureIndex) => {
+        const startTickOfMeasure = measureIndex * ticksPerMeasure;
+
+        // --- NUOVA LOGICA: Raggruppa per accordo e assegna l'intero accordo a un rigo ---
+        const measureChordGroups = groupNotesByTick(measureNotesOriginal, TICK_TOLERANCE_FOR_CHORDS);
+
+        const currentMeasureNotesTreble = [];
+        const currentMeasureNotesBass = [];
+
+        measureChordGroups.forEach(chordGroup => {
+             if (chordGroup.length === 0) return;
+
+             const lowestNote = chordGroup.reduce((minNote, currentNote) => {
+                 return (minNote === null || currentNote.midi < minNote.midi) ? currentNote : minNote;
+             }, null);
+
+             const targetStave = (lowestNote && lowestNote.midi >= NOTE_SPLIT_POINT) ? 'treble' : 'bass';
+
+             // Aggiungi l'intero gruppo (l'accordo) alla lista delle note per il rigo target
+             // Non aggiungiamo le note individuali, ma il gruppo per mantenerle unite.
+             // processStaveNotesAndRests si aspetta un array di gruppi di note.
+             if (targetStave === 'treble') {
+                 currentMeasureNotesTreble.push(chordGroup);
+             } else {
+                 currentMeasureNotesBass.push(chordGroup);
+             }
+        });
+        // --- FINE NUOVA LOGICA ---
+
+
+        // Processa i gruppi di accordi per creare tickables.
+        // processStaveNotesAndRests ora si aspetta una lista di gruppi di note (accordi).
+        const trebleTickablesVex = processStaveNotesAndRests(currentMeasureNotesTreble, "treble", ticksPerMeasure, startTickOfMeasure, measureIndex, ppq);
+        const bassTickablesVex = processStaveNotesAndRests(currentMeasureNotesBass, "bass", ticksPerMeasure, startTickOfMeasure, measureIndex, ppq);
+
+
+        vexflowMeasures.push({
+            measureIndex: measureIndex,
+            startTick: startTickOfMeasure,
+            staves: {
+                treble: trebleTickablesVex,
+                bass: bassTickablesVex
+            }
+        });
+    });
+
+    if (vexflowMeasures.length > 0) {
+         const lastMeasure = vexflowMeasures[vexflowMeasures.length - 1];
+         const lastMeasureEndTick = lastMeasure.startTick + ticksPerMeasure;
+         const lastNote = notesToProcess[notesToProcess.length - 1];
+         if (lastNote && lastMeasure && lastNote.ticks >= lastMeasure.startTick) {
+             vexflowMeasures.push({
+                 measureIndex: vexflowMeasures.length,
+                 startTick: lastMeasureEndTick,
+                 staves: { treble: [], bass: [] }
+             });
+              console.log("[CONVERT] Aggiunta misura vuota finale per doppia barra.");
+         } else if (notesToProcess.length === 0 && vexflowMeasures.length > 0) {
+         } else if (notesToProcess.length > 0 && vexflowMeasures.length === 0) {
+              console.warn("[CONVERT] Note presenti ma nessuna misura creata. Non aggiungo misura finale.");
+         }
+
+
+    } else if (notesToProcess.length > 0) {
+         console.error("[CONVERT] Impossibile generare VexFlow measures. Ticks per misura non valido.");
+         return null;
+    }
+
+
+    console.log(`[CONVERT] Struttura VexFlow JSON completata con ${vexflowMeasures.length} misure.`);
+    return {
+        metadata: {
+            ...metadataFromBackend,
+            timeSignature: timeSigStr,
+             keySignature: keySigForVexFlow
+        },
+        measures: vexflowMeasures
+    };
+}
+
+async function drawMusicSheetFromJson(vexflowData) {
+    console.log("[DRAW] Inizio disegno partitura...");
+
+    if (!vexflowData || !vexflowData.measures?.length) {
+        console.error("[DRAW] Dati JSON non validi o misure mancanti per il disegno.");
+        if(statusDisplay) statusDisplay.textContent = 'Impossibile disegnare la partitura. Dati non validi.';
+        container.innerHTML = '<p>Impossibile disegnare la partitura. Dati non validi.</p>';
+        disableButtons();
+        accuracyDisplay.textContent = "Accuratezza: N/A";
+        return;
+    }
+
+    stopPlayback();
+     svgElementsMap = new Map();
+
+    allParsedNotesFlattened = [];
+    currentNoteIndex = -1;
+    correctNotesCount = 0;
+    totalNotesInExercise = 0;
+    updateAccuracyDisplay();
+
+    setupRenderer();
+
+    const timeSig = vexflowData.metadata.timeSignature;
+    // const keySig = vexflowData.metadata.keySignature; // Non usiamo più l'armatura di chiave qui
+    const totalMeasures = vexflowData.measures.length;
+
     const totalLines = Math.ceil(totalMeasures / MEASURES_PER_LINE);
     const totalHeight = totalLines * SYSTEM_VERTICAL_SPACING + 60;
-    const totalWidth = STAVE_START_X + (STAVE_WIDTH * MEASURES_PER_LINE) + 50; // Larghezza basata su 4 battute
-    renderer.resize(totalWidth, totalHeight); console.log(`[DEBUG DRAW] Renderer resized: ${totalWidth} x ${totalHeight}`); let currentY = 40; const staveLayout = [];
-    for (let lineIndex = 0; lineIndex < totalLines; lineIndex++) { let firstStaveOfLine = null; let lastStaveOfLine = null; for (let measureInLine = 0; measureInLine < MEASURES_PER_LINE; measureInLine++) { const measureIndex = lineIndex * MEASURES_PER_LINE + measureInLine; if (measureIndex >= totalMeasures) break; const currentX = STAVE_START_X + (measureInLine * STAVE_WIDTH); const trebleStave = new Stave(currentX, currentY, STAVE_WIDTH); const bassStave = new Stave(currentX, currentY + STAVE_VERTICAL_SPACING, STAVE_WIDTH); if (measureIndex === 0) { trebleStave.addClef("treble").addTimeSignature(timeSig).addKeySignature(keySig); bassStave.addClef("bass").addTimeSignature(timeSig).addKeySignature(keySig); new StaveConnector(trebleStave, bassStave).setType(VF.StaveConnector.type.BRACE).setContext(context).draw(); } if (measureInLine === 0) { new StaveConnector(trebleStave, bassStave).setType(VF.StaveConnector.type.SINGLE_LEFT).setContext(context).draw(); firstStaveOfLine = trebleStave; } lastStaveOfLine = trebleStave; if (measureIndex === totalMeasures - 1) { trebleStave.setEndBarType(VF.Barline.type.END); bassStave.setEndBarType(VF.Barline.type.END); } trebleStave.setContext(context).draw(); bassStave.setContext(context).draw(); staveLayout[measureIndex] = { trebleStave, bassStave }; } if (lastStaveOfLine) { const lIdx = staveLayout.findIndex(p => p?.trebleStave === lastStaveOfLine); if (lIdx !== -1 && staveLayout[lIdx]) { const bS = staveLayout[lIdx].bassStave; new StaveConnector(lastStaveOfLine, bS).setType(VF.StaveConnector.type.SINGLE_RIGHT).setContext(context).draw(); } } currentY += SYSTEM_VERTICAL_SPACING; }
-    vexflowNotesMap.clear();
-    console.log("[DEBUG DRAW] Inizio creazione VexNotes e mappatura SVG...");
+    const staveAreaWidth = STAVE_WIDTH * MEASURES_PER_LINE;
+    const totalWidth = STAVE_START_X + staveAreaWidth + STAVE_START_X;
+
+    renderer.resize(totalWidth, totalHeight);
+    context.setFont('Arial', 10).setBackgroundFillStyle('#fff');
+
+    let currentY = 40;
+    const staveLayout = [];
+
+    console.log("[DRAW] Disegno righi e barre...");
+    for (let lineIndex = 0; lineIndex < totalLines; lineIndex++) {
+        for (let measureInLine = 0; measureInLine < MEASURES_PER_LINE; measureInLine++) {
+            const measureIndex = lineIndex * MEASURES_PER_LINE + measureInLine;
+            if (measureIndex >= totalMeasures) break;
+
+            const currentX = STAVE_START_X + (measureInLine * STAVE_WIDTH);
+
+            const trebleStave = new Stave(currentX, currentY, STAVE_WIDTH);
+            const bassStave = new Stave(currentX, currentY + STAVE_VERTICAL_SPACING, STAVE_WIDTH);
+
+            if (measureIndex === 0) {
+                trebleStave.addClef("treble").addTimeSignature(timeSig);
+                bassStave.addClef("bass").addTimeSignature(timeSig);
+                new Vex.Flow.StaveConnector(trebleStave, bassStave).setType(VF.StaveConnector.type.BRACE).setContext(context).draw();
+            } else if (measureInLine === 0) {
+                 trebleStave.addClef("treble");
+                 bassStave.addClef("bass");
+                 new Vex.Flow.StaveConnector(trebleStave, bassStave).setType(VF.StaveConnector.type.SINGLE_LEFT).setContext(context).draw();
+            } else {
+            }
+             const barlineType = measureIndex === totalMeasures - 1 ? VF.Barline.type.END : VF.Barline.type.SINGLE;
+             trebleStave.setEndBarType(barlineType);
+             bassStave.setEndBarType(barlineType);
+
+            trebleStave.setContext(context).draw();
+            bassStave.setContext(context).draw();
+
+            staveLayout[measureIndex] = { trebleStave, bassStave };
+        }
+
+        const lastMeasureIndexInLine = Math.min(lineIndex * MEASURES_PER_LINE + MEASURES_PER_LINE - 1, totalMeasures - 1);
+        if (lastMeasureIndexInLine >= lineIndex * MEASURES_PER_LINE && lastMeasureIndexInLine < totalMeasures - 1) {
+             const lastStavePair = staveLayout[lastMeasureIndexInLine];
+             if (lastStavePair) {
+                  new Vex.Flow.StaveConnector(lastStavePair.trebleStave, lastStavePair.bassStave).setType(VF.StaveConnector.type.SINGLE_RIGHT).setContext(context).draw();
+             }
+        }
+
+
+        currentY += SYSTEM_VERTICAL_SPACING;
+    }
+
+    console.log("[DRAW] Formatto e disegno note e resti...");
     vexflowData.measures.forEach((measureData, measureIndex) => {
-        const stavePair = staveLayout[measureIndex]; if (!stavePair) { console.warn(`[DEBUG DRAW] Staves non trovati per misura ${measureIndex + 1}`); return; } const { trebleStave, bassStave } = stavePair; const trebleNotesVex = []; const bassNotesVex = []; const currentMeasureTrebleNotesInfo = []; const currentMeasureBassNotesInfo = [];
+        const stavePair = staveLayout[measureIndex];
+        if (!stavePair) {
+            console.warn(`[DRAW] Staves non trovati per misura ${measureIndex + 1}`);
+            return;
+        }
 
-        // Funzione per creare StaveNote con GESTIONE ACCIDENTALI MIRATA
-        const createStaveNote = (noteJson, clef) => {
-            try {
-                const staveNote = new StaveNote({ keys: noteJson.keys, duration: noteJson.duration, clef: clef, auto_stem: true });
-                if (noteJson.dots > 0) { for (let d = 0; d < noteJson.dots; d++) Dot.buildAndAttach([staveNote], { index: 0 }); }
-                noteJson.keys.forEach((key, index) => { const hasSharp = key.includes("#"); const hasFlat = key.includes("b"); let accTypeToAdd = null; if (hasSharp) { accTypeToAdd = "#"; } else if (hasFlat) { if (!key.startsWith("b/")) { accTypeToAdd = "b"; } } if (accTypeToAdd) { if (!staveNote.modifiers.some(mod => mod instanceof Accidental && mod.getIndex() === index)) { staveNote.addModifier(new Accidental(accTypeToAdd), index); } } });
-                vexflowNotesMap.set(noteJson.id, staveNote);
-                return staveNote;
-            } catch (e) { console.error(`[DEBUG DRAW] Errore creazione StaveNote ID ${noteJson.id}:`, e); return null; }
-        };
+        const { trebleStave, bassStave } = stavePair;
+        const trebleTickablesVex = measureData.staves.treble || [];
+        const bassTickablesVex = measureData.staves.bass || [];
 
-        measureData.staves.treble.forEach(noteJson => { const noteObj = createStaveNote(noteJson, "treble"); if (noteObj) { trebleNotesVex.push(noteObj); currentMeasureTrebleNotesInfo.push({ id: noteJson.id, vexNote: noteObj }); } });
-        measureData.staves.bass.forEach(noteJson => { const noteObj = createStaveNote(noteJson, "bass"); if (noteObj) { bassNotesVex.push(noteObj); currentMeasureBassNotesInfo.push({ id: noteJson.id, vexNote: noteObj }); } });
+        const formatterWidthTreble = trebleStave.getNoteEndX() - trebleStave.getNoteStartX();
+        const formatterWidthBass = bassStave.getNoteEndX() - bassStave.getNoteStartX();
 
-        const mapSvgElements = (notesInfoArray, staveType) => { if (!context?.svg || notesInfoArray.length === 0) return; const allNoteGroups = Array.from(context.svg.querySelectorAll('g.vf-stavenote')); const startIndex = allNoteGroups.length - notesInfoArray.length; if (startIndex >= 0 && allNoteGroups.length >= notesInfoArray.length) { const newlyAddedNoteGroups = allNoteGroups.slice(startIndex); if (newlyAddedNoteGroups.length === notesInfoArray.length) { notesInfoArray.forEach((noteInfo, idx) => { const svgElement = newlyAddedNoteGroups[idx]; svgElementMap.set(noteInfo.id, svgElement); svgElement.setAttribute('id', noteInfo.id); }); } else { console.warn(`[DEBUG SVG MAP] Misura ${measureIndex+1} ${staveType} - MISMATCH note (${notesInfoArray.length}) vs <g.vf-stavenote> (${newlyAddedNoteGroups.length}). Mappatura fallita.`); } } else { console.warn(`[DEBUG SVG MAP] Misura ${measureIndex+1} ${staveType} - Non trovati abbastanza <g.vf-stavenote> (${allNoteGroups.length}) per mappare ${notesInfoArray.length} note. Mappatura fallita.`); } };
-        try { if (trebleNotesVex.length > 0) { const beams = Beam.generateBeams(trebleNotesVex, { stem_direction: VF.Stem.UP }); Formatter.FormatAndDraw(context, trebleStave, trebleNotesVex); mapSvgElements(currentMeasureTrebleNotesInfo, "Treble"); beams.forEach(b => b.setContext(context).draw()); } } catch (e) { console.error(`[DEBUG DRAW] ERRORE Formatter/Draw Treble misura ${measureIndex + 1}:`, e.message, e.stack); }
-        try { if (bassNotesVex.length > 0) { const beams = Beam.generateBeams(bassNotesVex, { stem_direction: VF.Stem.DOWN }); Formatter.FormatAndDraw(context, bassStave, bassNotesVex); mapSvgElements(currentMeasureBassNotesInfo, "Bass"); beams.forEach(b => b.setContext(context).draw()); } } catch (e) { console.error(`[DEBUG DRAW] ERRORE Formatter/Draw Bass misura ${measureIndex + 1}:`, e.message, e.stack); }
+
+        try {
+            if (trebleTickablesVex.length > 0) {
+                const [beats_str, val_str] = timeSig.split('/');
+                const beats = parseInt(beats_str); const val = parseInt(val_str);
+                const voice = new Voice({ num_beats: beats, beat_value: val }).setStrict(false).addTickables(trebleTickablesVex);
+                new Formatter().joinVoices([voice]).format([voice], formatterWidthTreble);
+                voice.draw(context, trebleStave);
+            }
+        } catch (e) { console.error(`ERRORE Draw Voice Treble misura ${measureIndex + 1}:`, e); }
+
+        try {
+            if (bassTickablesVex.length > 0) {
+                 const [beats_str, val_str] = timeSig.split('/');
+                const beats = parseInt(beats_str); const val = parseInt(val_str);
+                const voice = new Voice({ num_beats: beats, beat_value: val }).setStrict(false).addTickables(bassTickablesVex);
+                new Formatter().joinVoices([voice]).format([voice], formatterWidthBass);
+                voice.draw(context, bassStave);
+            }
+        } catch (e) { console.error(`ERRORE Draw Voice Bass misura ${measureIndex + 1}:`, e); }
     });
-    console.log(`[DEBUG SVG MAP] Mappatura SVG completata. svgElementMap size: ${svgElementMap.size}`);
-    if (svgElementMap.size !== allParsedNotes.length) { console.warn(`[DEBUG SVG MAP] ATTENZIONE: Mappati ${svgElementMap.size} SVG vs ${allParsedNotes.length} note parsate.`); const missingIds = allParsedNotes.filter(note => !svgElementMap.has(note.id)); if (missingIds.length > 0) console.warn(`[DEBUG SVG MAP] IDs note non mappate a SVG:`, missingIds.map(n => n.id)); }
-    else { console.log(`[DEBUG SVG MAP] Numero elementi SVG mappati corrisponde a note parsate.`); }
-    console.log("[DEBUG DRAW] Partitura disegnata.");
+
+    console.log("[DRAW] Mapping elementi SVG e creazione elenco note piatto...");
+     vexflowData.measures.forEach(measureData => {
+         ['treble', 'bass'].forEach(staveType => {
+             const tickables = measureData.staves[staveType];
+
+             tickables.forEach(tickable => {
+                const notesInThisTickable = (tickable instanceof Vex.Flow.Beam) ? tickable.getNotes() : [tickable];
+
+                notesInThisTickable.forEach(noteOrChordTickable => {
+                     if (noteOrChordTickable instanceof Vex.Flow.StaveNote && !noteOrChordTickable.isRest()) {
+                         const originalNotesInGroup = noteOrChordTickable.originalNotes;
+
+                          if (originalNotesInGroup) {
+                              originalNotesInGroup.forEach(originalNoteData => {
+                                  if (!allParsedNotesFlattened.find(n => n.id === originalNoteData.id)) {
+                                       allParsedNotesFlattened.push({ ...originalNoteData, vexflowTickable: noteOrChordTickable });
+                                  }
+                              });
+                          } else {
+                             console.warn(`[DRAW] No originalNotes found for tickable. Cannot add to flattened list.`);
+                         }
+                     }
+                });
+             });
+         });
+     });
+
+     allParsedNotesFlattened.sort((a, b) => a.ticks - b.ticks || a.midi - b.midi);
+
+     console.log("[DRAW] Note appiattite per riproduzione/esercizio:", allParsedNotesFlattened.map(n => ({ id: n.id, ticks: n.ticks, midi: n.midi, name: n.noteNameWithOctave, durationTicks: n.durationTicks, accidental: n.accidental, hasTickable: !!n.vexflowTickable })));
+
+     totalNotesInExercise = allParsedNotesFlattened.filter(note => note.midi >= 0).length;
+     updateAccuracyDisplay();
+
+     mapTickablesToSvgElements();
+
+    console.log("[DRAW] Partitura disegnata.");
+    if(statusDisplay) statusDisplay.textContent = "Partitura caricata. Pronto per l'esercizio.";
+    enableButtons();
 }
 
+function setupRenderer() {
+     removeHighlightClasses();
 
-// --- Inizializzazione Applicazione ---
-function init() {
-    console.log("[DEBUG INIT] Inizializzazione applicazione...");
-    // Aggiunto exportPngButton al controllo
-    if (!playButton || !stopButton || !fileInput || !playbackStatus || !container || !accuracyDisplay || !exportPngButton) {
-        console.error("[INIT ERROR] Elementi UI principali non trovati!");
-        alert("Errore interfaccia. Ricarica la pagina.");
+    container.innerHTML = '';
+    renderer = new Renderer(container, Renderer.Backends.SVG);
+    renderer.resize(800, 600);
+    context = renderer.getContext();
+    context.setFont('Arial', 10).setBackgroundFillStyle('#fff');
+}
+
+function removeHighlightClasses() {
+    if (!container) return;
+    const highlighted = container.querySelectorAll('.current-note-highlight, .correct-note, .incorrect-note-flash');
+    highlighted.forEach(el => {
+        el.classList.remove('current-note-highlight', 'correct-note', 'incorrect-note-flash');
+        el.style.animation = '';
+        el.style.fill = '';
+        el.style.stroke = '';
+    });
+}
+
+async function handleFileSelect(event) {
+    console.log("[FILE] Selezione file rilevata.");
+    disableButtons();
+    stopPlayback();
+
+    const file = event.target.files[0];
+    if (!file) {
+        console.log("[FILE] Nessun file selezionato.");
+        if (statusDisplay) statusDisplay.textContent = "Carica un file MIDI.";
+        setupRenderer();
+        accuracyDisplay.textContent = "Accuratezza: N/A";
         return;
     }
-    setupRenderer();
-    requestMIDIAccess();
-    fileInput.addEventListener('change', handleFileSelect, false);
-    playButton.addEventListener('click', playMidi);
-    stopButton.addEventListener('click', stopPlayback);
-    exportPngButton.addEventListener('click', exportSheetAsPNG); // <<< NUOVO LISTENER
 
-    console.log("[DEBUG INIT] Applicazione inizializzata e pronta.");
-}
+    console.log(`[FILE] File selezionato: ${file.name}`);
 
-// --- Setup Renderer VexFlow ---
-function setupRenderer() {
-    container.innerHTML = ''; vexflowNotesMap.clear(); svgElementMap.clear(); // Pulisci mappe
-    renderer = new Renderer(container, Renderer.Backends.SVG); renderer.resize(STAVE_START_X + (STAVE_WIDTH * MEASURES_PER_LINE) + 50, 200); context = renderer.getContext(); context.setFont('Arial', 10).setBackgroundFillStyle('#fff');
-}
+    container.innerHTML = '<p>Caricamento e analisi...</p>';
+    if(statusDisplay) statusDisplay.textContent = "Lettura file...";
 
-// --- Gestione Selezione File MIDI ---
-async function handleFileSelect(event) {
-    stopPlayback(); const file = event.target.files[0]; if (!file) return; console.log(`[DEBUG FILE] Caricamento file: ${file.name}`); container.innerHTML = '<p>Caricamento e analisi...</p>'; updateAccuracyDisplay(true); if(playButton) playButton.disabled = true; if(stopButton) stopButton.disabled = true; if(playbackStatus) playbackStatus.textContent = ""; if(exportPngButton) exportPngButton.disabled = true; // <<< DISABILITA ESPORTA
     const reader = new FileReader();
-    reader.onload = async (e) => {
-        console.log("[DEBUG FILE] File letto.");
+    reader.onloadend = async () => {
+        if (reader.error) {
+             console.error("[FILE] Errore lettura file:", reader.error);
+             alert("Impossibile leggere il file selezionato.");
+             container.innerHTML = '<p>Errore lettura file.</p>';
+             if(statusDisplay) statusDisplay.textContent = "Erro lettura file.";
+             return;
+        }
+
+        const base64String = reader.result;
+        console.log("[FILE] File letto. Invio al backend per elaborazione...");
+        if(statusDisplay) statusDisplay.textContent = "Invio al backend...";
+
         try {
-            const midiUint8Array = new Uint8Array(e.target.result); console.log("[DEBUG FILE] Parsing MIDI..."); if (typeof MidiParser === 'undefined') throw new Error("MidiParser non trovato!"); parsedMidi = MidiParser.Uint8(midiUint8Array); if (!parsedMidi) { console.error("[DEBUG FILE] Parsing fallito."); alert("Errore parsing MIDI."); container.innerHTML = '<p>Errore parsing.</p>'; updateAccuracyDisplay(true); return; }
-            console.log("[DEBUG FILE] Parsing completato. Conversione in JSON..."); vexflowJsonData = convertMidiDataToJson(parsedMidi);
-            totalNotesInSong = allParsedNotes.length; correctNotesCount = 0; nextTrebleNoteIndex = 0; nextBassNoteIndex = 0; activeTrebleNoteID = null; activeBassNoteID = null;
-            console.log(`[DEBUG FILE] Reset stato: totalNotes=${totalNotesInSong}`);
-            if (vexflowJsonData && totalNotesInSong > 0) {
-                console.log(`[DEBUG FILE] Dati pronti (${totalNotesInSong} note). Chiamata a drawMusicSheetFromJson...`); updateAccuracyDisplay(); drawMusicSheetFromJson(vexflowJsonData);
-                console.log("[DEBUG FILE] Attesa breve per rendering...");
-                setTimeout(() => {
-                    console.log(`[DEBUG FILE] Impostazione e highlight note iniziali...`);
-                    setActiveNotes();
-                    highlightActiveNotes();
-                    if(playButton) playButton.disabled = false;
-                    if(exportPngButton) exportPngButton.disabled = false; // <<< ABILITA ESPORTA
-                    console.log("[DEBUG FILE] Partitura pronta per interazione e playback.");
-                }, 150); // Leggero ritardo per assicurare il rendering SVG prima di interagire
-            } else {
-                console.warn("[DEBUG FILE] Nessun dato valido da disegnare.");
-                alert(totalNotesInSong === 0 ? "Il file non contiene note." : "Errore conversione dati.");
-                container.innerHTML = `<p>${totalNotesInSong === 0 ? 'Nessuna nota nel file.' : 'Errore conversione.'}</p>`;
-                updateAccuracyDisplay(true);
-                if(exportPngButton) exportPngButton.disabled = true; // <<< MANTIENI DISABILITATO
+            const response = await fetch('http://127.0.0.1:5000/process_midi', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ midiData: base64String })
+            });
+
+            if (!response.ok) {
+                const errorData = await response.json().catch(() => ({ error: response.statusText, detail: "Nessun JSON di errore nella risposta backend." }));
+                const errorMessage = errorData.error || response.statusText;
+                const errorDetail = errorData.detail || "";
+                console.error(`[FILE] Errore risposta backend: HTTP ${response.status} - ${errorMessage}`, errorData);
+                throw new Error(`Elaborazione backend fallita: ${errorMessage} (Status: ${response.status}). Dettagli: ${errorDetail.substring(0, 500)}...`);
             }
+
+            const backendData = await response.json();
+            console.log("[FILE] Risposta JSON ricevuta con successo.");
+
+            const allParsedNotes = backendData.allParsedNotes || [];
+             if (!backendData.metadata) {
+                 console.warn("[FILE] Metadati mancanti nella risposta backend.");
+                 backendData.metadata = {};
+             }
+            console.log(`[FILE] Ricevute ${allParsedNotes.length} note individuali dal backend.`);
+
+            vexflowData = generateVexflowJson(backendData.metadata, allParsedNotes);
+
+            if (vexflowData && vexflowData.measures?.length > 0) {
+                 console.log("[FILE] Generazione VexFlow JSON completata. Disegno partitura...");
+                drawMusicSheetFromJson(vexflowData);
+            } else {
+                 const message = allParsedNotes.length === 0 ? "Il file MIDI non contiene note valide per il disegno." : "Errore durante la preparazione dei dati per il disegno. Controlla la console.";
+                 alert(message);
+                 container.innerHTML = `<p>${message}</p>`;
+                 if(statusDisplay) statusDisplay.textContent = message;
+                 console.warn("[FILE] Impossibile disegnare partitura. Dati non validi o note mancanti.");
+                 disableButtons();
+                 accuracyDisplay.textContent = "Accuratezza: N/A";
+            }
+
         } catch (error) {
-            console.error("[DEBUG FILE] Errore grave processo file:", error);
-            alert(`Errore elaborazione file: ${error.message}`);
+            console.error("[FILE] Errore generale elaborazione:", error);
+            alert(`Si è verificato un errore durante l'elaborazione del file: ${error.message}. Controlla la console.`);
             container.innerHTML = `<p>Errore: ${error.message}</p>`;
-            updateAccuracyDisplay(true);
-            if(exportPngButton) exportPngButton.disabled = true; // <<< MANTIENI DISABILITATO
+            if(statusDisplay) statusDisplay.textContent = `Errore: ${error.message}`;
+            disableButtons();
+             accuracyDisplay.textContent = "Accuratezza: N/A";
         }
     };
-    reader.onerror = (err) => { console.error("[DEBUG FILE] Errore lettura file:", err); alert("Impossibile leggere il file."); updateAccuracyDisplay(true); if(exportPngButton) exportPngButton.disabled = true; }; // <<< MANTIENI DISABILITATO
-    reader.readAsArrayBuffer(file);
+    reader.readAsDataURL(file);
+}
+
+function mapTickablesToSvgElements() {
+    console.log("[DRAW] Tentativo di mappare tickables agli elementi SVG...");
+     svgElementsMap.clear();
+
+     const svg = container.querySelector('svg');
+     if (!svg) {
+         console.warn("[DRAW] Elemento SVG non trovato per il mapping.");
+         return;
+     }
+
+     const vexflowCanvas = svg.querySelector('.vexflow-canvas');
+     if (!vexflowCanvas) {
+         console.warn("[DRAW] Gruppo .vexflow-canvas non trovato per il mapping.");
+         return;
+     }
+
+     const allSvgGElements = Array.from(vexflowCanvas.querySelectorAll('g'));
+
+     const tickableToSvgElementMap = new Map();
+     let svgElementIndex = 0;
+
+     if (vexflowData && vexflowData.measures) {
+         vexflowData.measures.forEach(measureData => {
+             ['treble', 'bass'].forEach(staveType => {
+                 const tickables = measureData.staves[staveType];
+
+                 tickables.forEach(tickable => {
+                    if (svgElementIndex < allSvgGElements.length) {
+                         const gElement = allSvgGElements[svgElementIndex];
+                         tickableToSvgElementMap.set(tickable, gElement);
+                         svgElementIndex++;
+                    } else {
+                         console.warn(`[DRAW] Meno elementi SVG (<g>) del previsto per i tickables. Saltato mapping per tickable.`);
+                    }
+                 });
+             });
+         });
+     }
+
+     svgElementsMap.clear();
+
+     tickableToSvgElementMap.forEach((svgElement, tickable) => {
+         const originalNotesGroup = tickable.originalNotes;
+
+         if (originalNotesGroup && originalNotesGroup.length > 0) {
+             originalNotesGroup.forEach(originalNoteData => {
+                 svgElementsMap.set(originalNoteData.id, svgElement);
+             });
+         } else if (tickable instanceof Vex.Flow.StaveNote && tickable.isRest()) {
+         } else {
+             console.warn(`[DRAW] Original notes data missing for tickable. Cannot map to SVG element.`);
+         }
+     });
+
+
+     console.log(`[DRAW] Mapping completo. Mappati ${svgElementsMap.size} ID nota a elementi SVG.`);
 }
 
 
-// --- Gestione Input MIDI ---
-function requestMIDIAccess() { if (navigator.requestMIDIAccess) { navigator.requestMIDIAccess({ sysex: false }).then(onMIDISuccess, onMIDIFailure); } else { console.warn("[DEBUG MIDI] Web MIDI API non supportata."); alert("Web MIDI non supportata."); } }
-function onMIDISuccess(midi) { console.log("[DEBUG MIDI] Accesso MIDI Riuscito!"); midiAccess = midi; const inputs = midiAccess.inputs.values(); let found = false; for (let input = inputs.next(); input && !input.done; input = inputs.next()) { const mi = input.value; console.log(`[DEBUG MIDI] Input trovato: ${mi.name}`); mi.onmidimessage = onMIDIMessage; found = true; } if (!found) console.warn("[DEBUG MIDI] Nessun input MIDI trovato."); midiAccess.onstatechange = (event) => { const p = event.port; console.log(`[DEBUG MIDI] Stato MIDI cambiato: ${p.name} -> ${p.state}`); if (p.type === "input" && p.state === "connected" && !p.onmidimessage) p.onmidimessage = onMIDIMessage; else if (p.type === "input" && p.state === "disconnected") p.onmidimessage = null; }; }
-function onMIDIFailure(msg) { console.error(`[DEBUG MIDI] Accesso MIDI Fallito: ${msg}`); alert(`Accesso MIDI Fallito: ${msg}.`); }
-function onMIDIMessage(event) { if (!event?.data || event.data.length < 3) return; const status = event.data[0]; const command = status >> 4; const noteNumber = event.data[1]; const velocity = event.data[2]; if (command === 9 && velocity > 0) { handlePlayedNote(noteNumber); } }
+function highlightCurrentNote(noteData) {
+     removeHighlightClasses();
 
-// --- Logica di Gioco/Interazione (Flussi Indipendenti) ---
-function setActiveNotes() {
-    let foundTreble = false; while (nextTrebleNoteIndex < trebleNotes.length) { const note = trebleNotes[nextTrebleNoteIndex]; const fullNoteInfo = allParsedNotes.find(n => n.id === note.id); if (fullNoteInfo && !fullNoteInfo.played) { activeTrebleNoteID = note.id; foundTreble = true; break; } nextTrebleNoteIndex++; } if (!foundTreble) activeTrebleNoteID = null;
-    let foundBass = false; while (nextBassNoteIndex < bassNotes.length) { const note = bassNotes[nextBassNoteIndex]; const fullNoteInfo = allParsedNotes.find(n => n.id === note.id); if (fullNoteInfo && !fullNoteInfo.played) { activeBassNoteID = note.id; foundBass = true; break; } nextBassNoteIndex++; } if (!foundBass) activeBassNoteID = null;
-    checkEndOfSong();
+     if (!noteData || !noteData.id) {
+          console.warn("[HIGHLIGHT] Dati nota non validi per evidenziazione.");
+          return;
+     }
+
+     const svgElementToHighlight = svgElementsMap.get(noteData.id);
+
+     if (svgElementToHighlight) {
+          svgElementToHighlight.classList.add('current-note-highlight');
+
+          const containerRect = container.getBoundingClientRect();
+          const elementRect = svgElementToHighlight.getBoundingClientRect();
+
+          const relativeTop = elementRect.top - containerRect.top + container.scrollTop;
+          const relativeBottom = elementRect.bottom - containerRect.top + container.scrollTop;
+
+          if (relativeTop < container.scrollTop + containerRect.height * 0.1) {
+              container.scrollTop = relativeTop - containerRect.height * 0.2;
+          } else if (relativeBottom > container.scrollTop + containerRect.height * 0.9) {
+              container.scrollTop = relativeBottom - containerRect.height + containerRect.height * 0.2;
+          }
+
+     } else {
+         console.warn(`[HIGHLIGHT] Non è stato possibile trovare l'elemento SVG corrispondente alla nota ID ${noteData.id} per l'evidenziazione.`);
+     }
 }
-function handlePlayedNote(playedMidiNoteNumber) {
-    let noteProcessed = false;
-    if (activeTrebleNoteID) { const activeTrebleNote = trebleNotes[nextTrebleNoteIndex]; if (activeTrebleNote && activeTrebleNote.id === activeTrebleNoteID && activeTrebleNote.midi === playedMidiNoteNumber) { console.log(`CORRETTO (Treble)! Nota ${activeTrebleNote.vexNoteName} (MIDI ${activeTrebleNote.midi})`); const fullNoteInfo = allParsedNotes.find(n => n.id === activeTrebleNoteID); if (fullNoteInfo && !fullNoteInfo.played) { correctNotesCount++; fullNoteInfo.played = true; } markNoteAsCorrect(activeTrebleNote); nextTrebleNoteIndex++; setActiveNotes(); highlightActiveNotes(); noteProcessed = true; } }
-    if (activeBassNoteID && !noteProcessed) { const activeBassNote = bassNotes[nextBassNoteIndex]; if (activeBassNote && activeBassNote.id === activeBassNoteID && activeBassNote.midi === playedMidiNoteNumber) { console.log(`CORRETTO (Bass)! Nota ${activeBassNote.vexNoteName} (MIDI ${activeBassNote.midi})`); const fullNoteInfo = allParsedNotes.find(n => n.id === activeBassNoteID); if (fullNoteInfo && !fullNoteInfo.played) { correctNotesCount++; fullNoteInfo.played = true; } markNoteAsCorrect(activeBassNote); nextBassNoteIndex++; setActiveNotes(); highlightActiveNotes(); noteProcessed = true; } }
-    if (!noteProcessed) { const playedName = midiNumberToVexflowNote(playedMidiNoteNumber); let expectedStr = ""; if (activeTrebleNoteID) { const note = trebleNotes[nextTrebleNoteIndex]; expectedStr += `${note?.vexNoteName}(${note?.midi})` } if (activeBassNoteID) { const note = bassNotes[nextBassNoteIndex]; expectedStr += (expectedStr ? " o " : "") + `${note?.vexNoteName}(${note?.midi})` } console.log(`SBAGLIATO. Suonato: ${playedName} (${playedMidiNoteNumber}), Atteso: ${expectedStr || 'Nessuna nota attiva?'}`); if (activeTrebleNoteID) { const note = trebleNotes[nextTrebleNoteIndex]; if(note) markNoteAsIncorrect(note); } if (activeBassNoteID) { const note = bassNotes[nextBassNoteIndex]; if(note) markNoteAsIncorrect(note); } }
+
+function flashIncorrectNote(noteData) {
+    if (!noteData || !noteData.id) return;
+
+    const svgElement = svgElementsMap.get(noteData.id);
+    if (svgElement) {
+        svgElement.classList.add('incorrect-note-flash');
+        setTimeout(() => {
+            if (!svgElement.classList.contains('correct-note')) {
+                 svgElement.classList.remove('incorrect-note-flash');
+            }
+        }, 500);
+    } else {
+         console.warn(`[FLASH] Impossibile trovare elemento SVG per flash nota errata ID ${noteData.id}.`);
+    }
+}
+
+function handleUserNoteInput(midiNumber) {
+    lastUserMidiInput = midiNumber;
+    if (playbackInterval !== null && currentNoteIndex < allParsedNotesFlattened.length) {
+        const expectedNote = allParsedNotesFlattened[currentNoteIndex];
+
+        const chordNotes = allParsedNotesFlattened.filter(note =>
+             note.ticks === expectedNote.ticks &&
+             note.vexflowTickable === expectedNote.vexflowTickable
+        );
+
+        const isCorrect = chordNotes.some(note => note.midi === midiNumber);
+
+        if (isCorrect) {
+            console.log(`[INPUT] Corretto! Suonata nota MIDI ${midiNumber} (attesa una tra ${chordNotes.map(n => n.midi).join(', ')}).`);
+            correctNotesCount++;
+            updateAccuracyDisplay();
+
+             const svgElement = svgElementsMap.get(expectedNote.vexflowTickable.originalNotes[0].id);
+             if (svgElement) {
+                 svgElement.classList.remove('current-note-highlight');
+                 svgElement.classList.add('correct-note');
+             } else {
+                  console.warn(`[INPUT] Impossibile trovare elemento SVG per marcare come corretto tickable per nota ID ${expectedNote.id}.`);
+             }
+
+
+            currentNoteIndex++;
+
+            if (currentNoteIndex < allParsedNotesFlattened.length) {
+                highlightCurrentNote(allParsedNotesFlattened[currentNoteIndex]);
+            } else {
+                stopPlayback();
+                if(statusDisplay) statusDisplay.textContent = "Esercizio completato!";
+                console.log("[EXERCISE] Esercizio completato.");
+            }
+
+        } else {
+            console.log(`[INPUT] Errato. Suonata nota MIDI ${midiNumber}, attesa una tra ${chordNotes.map(n => n.midi).join(', ')}.`);
+            flashIncorrectNote(expectedNote.vexflowTickable.originalNotes[0]);
+        }
+    } else {
+         console.log(`[INPUT] Input MIDI ${midiNumber} ricevuto, ma esercizio non attivo.`);
+    }
+}
+
+function enableButtons() {
+    if (playButton) playButton.disabled = false;
+    if (stopButton) stopButton.disabled = false;
+     if (exportPngButton && container.querySelector('svg')) exportPngButton.disabled = false;
+     if (speedSlider) speedSlider.disabled = false;
+}
+
+function disableButtons() {
+    if (playButton) playButton.disabled = true;
+    if (stopButton) stopButton.disabled = true;
+    if (exportPngButton) exportPngButton.disabled = true;
+    if (speedSlider) speedSlider.disabled = true;
+}
+
+function updateAccuracyDisplay() {
+    if (accuracyDisplay) {
+        if (totalNotesInExercise > 0) {
+            const percentage = (correctNotesCount / totalNotesInExercise) * 100;
+            accuracyDisplay.textContent = `Accuratezza: ${correctNotesCount}/${totalNotesInExercise} (${percentage.toFixed(0)}%)`;
+        } else {
+            accuracyDisplay.textContent = "Accuratezza: N/A";
+        }
+    }
+}
+
+function startPlayback() {
+    if (!allParsedNotesFlattened || allParsedNotesFlattened.length === 0) {
+        console.warn("[PLAYBACK] Nessuna nota da riprodurre.");
+         if (statusDisplay) statusDisplay.textContent = "Nessuna nota trovata per l'esercizio.";
+        return;
+    }
+
+     stopPlayback();
+     removeHighlightClasses();
+     currentNoteIndex = 0;
+     correctNotesCount = 0;
+
+    if(statusDisplay) statusDisplay.textContent = "Esercizio in corso...";
+
+    highlightCurrentNote(allParsedNotesFlattened[currentNoteIndex]);
     updateAccuracyDisplay();
-}
-function checkEndOfSong() { if (activeTrebleNoteID === null && activeBassNoteID === null) { if (nextTrebleNoteIndex >= trebleNotes.length && nextBassNoteIndex >= bassNotes.length) { console.log("[DEBUG END] --- BRANO COMPLETATO! ---"); const finalAccuracy = calculateAccuracy(); updateAccuracyDisplay(); setTimeout(()=> { alert(`Complimenti! Accuratezza finale: ${finalAccuracy}%.`); }, 100); } } }
 
-// --- Funzioni di Modifica Visiva (USANO svgElementMap) ---
-function markNoteAsCorrect(noteInfo) { if (!noteInfo?.id) return; const svgGroup = svgElementMap.get(noteInfo.id); if (svgGroup) { svgGroup.classList.remove('current-note-highlight', 'incorrect-note-flash', 'playback-highlight'); svgGroup.classList.add('correct-note'); } else { console.warn(`[VISUAL WARN] SVG per ID "${noteInfo.id}" non trovato (correct).`); } }
-function markNoteAsIncorrect(noteInfo) { if (!noteInfo?.id) return; const svgGroup = svgElementMap.get(noteInfo.id); if (svgGroup) { svgGroup.classList.add('incorrect-note-flash'); setTimeout(() => { if (svgGroup?.classList) svgGroup.classList.remove('incorrect-note-flash'); }, 500); } else { console.warn(`[VISUAL WARN] SVG per ID "${noteInfo.id}" non trovato (incorrect).`); } }
-function highlightActiveNotes() {
-    svgElementMap.forEach(element => element.classList.remove('current-note-highlight')); let firstElementToScroll = null;
-    if (activeTrebleNoteID) { const svgGroup = svgElementMap.get(activeTrebleNoteID); if (svgGroup) { svgGroup.classList.add('current-note-highlight'); if (!firstElementToScroll && container.scrollHeight > container.clientHeight) { const cRect = container.getBoundingClientRect(); const nRect = svgGroup.getBoundingClientRect(); const b = 50; if (nRect.top < cRect.top + b || nRect.bottom > cRect.bottom - b) firstElementToScroll = svgGroup; } } else { console.warn(`[VISUAL WARN] SVG per ID Treble "${activeTrebleNoteID}" non trovato (highlight).`); } }
-    if (activeBassNoteID) { const svgGroup = svgElementMap.get(activeBassNoteID); if (svgGroup) { svgGroup.classList.add('current-note-highlight'); if (!firstElementToScroll && container.scrollHeight > container.clientHeight) { const cRect = container.getBoundingClientRect(); const nRect = svgGroup.getBoundingClientRect(); const b = 50; if (nRect.top < cRect.top + b || nRect.bottom > cRect.bottom - b) firstElementToScroll = svgGroup; } } else { console.warn(`[VISUAL WARN] SVG per ID Bass "${activeBassNoteID}" non trovato (highlight).`); } }
-    if (firstElementToScroll) { const cRect = container.getBoundingClientRect(); const nRect = firstElementToScroll.getBoundingClientRect(); const nTopRel = nRect.top - cRect.top + container.scrollTop; const dScroll = nTopRel - (container.clientHeight / 3); const maxScroll = container.scrollHeight - container.clientHeight; const fScroll = Math.max(0, Math.min(dScroll, maxScroll)); container.scrollTo({ top: fScroll, behavior: 'smooth' }); }
+    console.log("[PLAYBACK] Esercizio avviato. Attesa input utente per la prima nota.");
 }
 
-// --- NUOVE FUNZIONI PER PLAYBACK AUDIO ---
-function initAudio() { if (!audioCtx) { try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); masterGainNode = audioCtx.createGain(); masterGainNode.connect(audioCtx.destination); masterGainNode.gain.setValueAtTime(0.7, audioCtx.currentTime); console.log("[AUDIO] AudioContext inizializzato."); } catch (e) { console.error("[AUDIO] Web Audio API non supportata.", e); alert("Web Audio API non supportata."); return false; } } if (audioCtx.state === 'suspended') audioCtx.resume(); return true; }
-function midiToFreq(midiNote) { return 440 * Math.pow(2, (midiNote - 69) / 12); }
-function playMidi() {
-    if (isPlaying) return; if (!allParsedNotes?.length) return; if (!initAudio()) return;
-    console.log("[AUDIO] Avvio Playback..."); isPlaying = true; if(playButton) playButton.disabled = true; if(stopButton) stopButton.disabled = false; if(playbackStatus) playbackStatus.textContent = "Riproduzione..."; scheduledVisuals = []; activeOscillators = [];
-    if (ppq <= 0) { console.error("[AUDIO] PPQ non valido."); stopPlayback(); return; }
-    const secondsPerBeat = midiTempo / 1000000; const secondsPerTick = secondsPerBeat / ppq; console.log(`[AUDIO] Tempo: ${midiTempo} us/beat, PPQ: ${ppq}, Sec/Tick: ${secondsPerTick}`);
-    const playbackStartTime = audioCtx.currentTime; let lastNoteEndTime = 0;
-    svgElementMap.forEach(element => element.classList.remove('current-note-highlight', 'correct-note', 'incorrect-note-flash', 'playback-highlight')); // Pulisci tutti gli stili
-    allParsedNotes.forEach(note => {
-        const noteStartTimeSec = note.ticks * secondsPerTick; const noteDurationSec = Math.max(0.05, note.durationTicks * secondsPerTick); const absoluteStartTime = playbackStartTime + noteStartTimeSec; const absoluteStopTime = absoluteStartTime + noteDurationSec; const frequency = midiToFreq(note.midi);
-        const oscillator = audioCtx.createOscillator(); const gainNode = audioCtx.createGain(); oscillator.type = 'triangle'; oscillator.frequency.setValueAtTime(frequency, absoluteStartTime); gainNode.gain.setValueAtTime(0.5, absoluteStartTime); gainNode.gain.linearRampToValueAtTime(0, absoluteStopTime); oscillator.connect(gainNode); gainNode.connect(masterGainNode);
-        oscillator.start(absoluteStartTime); oscillator.stop(absoluteStopTime); activeOscillators.push(oscillator);
-        const visualTimeoutId = setTimeout(() => { playbackHighlightNote(note.id); }, noteStartTimeSec * 1000); scheduledVisuals.push(visualTimeoutId);
-        if (absoluteStopTime > lastNoteEndTime) lastNoteEndTime = absoluteStopTime;
-    });
-    const endDelayMs = (lastNoteEndTime - playbackStartTime) * 1000 + 200; const endTimeoutId = setTimeout(() => { console.log("[AUDIO] Playback terminato."); stopPlayback(false); }, endDelayMs); scheduledVisuals.push(endTimeoutId);
-    console.log(`[AUDIO] ${allParsedNotes.length} note programmate. Durata stimata: ${(lastNoteEndTime - playbackStartTime).toFixed(2)}s`);
-}
-function stopPlayback(resetUserInteraction = true) {
-    if (!isPlaying && scheduledVisuals.length === 0) return; console.log("[AUDIO] Stop Playback richiesto..."); isPlaying = false;
-    activeOscillators.forEach(osc => { try { osc.stop(audioCtx.currentTime); } catch (e) { /* Ignora */ } }); activeOscillators = [];
-    scheduledVisuals.forEach(timeoutId => clearTimeout(timeoutId)); scheduledVisuals = [];
-    svgElementMap.forEach(element => element.classList.remove('playback-highlight')); // Rimuovi solo highlight playback
-    if(playButton) playButton.disabled = (allParsedNotes.length === 0); if(stopButton) stopButton.disabled = true; if(playbackStatus) playbackStatus.textContent = "";
-    if (resetUserInteraction && allParsedNotes.length > 0) { // Aggiunto controllo allParsedNotes
-         console.log("[AUDIO] Reset interazione utente.");
-         highlightActiveNotes(); // Ri-evidenzia note interattive solo se c'è una partitura
+function stopPlayback() {
+    if (playbackInterval !== null) {
+        clearInterval(playbackInterval);
+        playbackInterval = null;
+        console.log("[PLAYBACK] Esercizio fermato.");
     }
+    removeHighlightClasses();
+     currentNoteIndex = -1;
+     if(statusDisplay && !statusDisplay.textContent.includes("completato")) {
+         statusDisplay.textContent = "Esercizio fermato.";
+     }
 }
-function playbackHighlightNote(noteId) {
-    if (!isPlaying) return; svgElementMap.forEach(element => element.classList.remove('playback-highlight')); const svgGroup = svgElementMap.get(noteId);
-    if (svgGroup) { svgGroup.classList.add('playback-highlight'); if (container.scrollHeight > container.clientHeight) { const cRect = container.getBoundingClientRect(); const nRect = svgGroup.getBoundingClientRect(); const b = 50; if (nRect.top < cRect.top + b || nRect.bottom > cRect.bottom - b) { const nTopRel = nRect.top - cRect.top + container.scrollTop; const dScroll = nTopRel - (container.clientHeight / 3); const maxScroll = container.scrollHeight - container.clientHeight; const fScroll = Math.max(0, Math.min(dScroll, maxScroll)); container.scrollTo({ top: fScroll, behavior: 'smooth' }); } }
-    } // else { console.warn(`[VISUAL PLAYBACK WARN] SVG per ID "${noteId}" non trovato.`); }
+
+function updateSpeedDisplay(value) {
+     const speedMap = {
+        1: "Molto Lenta", 2: "Lenta", 3: "Moderata",
+        4: "Normale", 5: "Normale",
+        6: "Media Veloce", 7: "Veloce", 8: "Molto Veloce",
+        9: "Presto", 10: "Prestissimo"
+     };
+     if (speedValueSpan) {
+          speedValueSpan.textContent = speedMap[value] || "Normale";
+     }
 }
 
-// --- Funzioni Utilità ---
-function updateAccuracyDisplay(reset = false) { if (!accuracyDisplay) return; if (reset || totalNotesInSong === 0) { accuracyDisplay.textContent = "Accuratezza: N/A"; return; } const accuracy = calculateAccuracy(); const progressText = `${correctNotesCount}/${totalNotesInSong}`; accuracyDisplay.textContent = `Accuratezza: ${accuracy}% (${progressText})`; }
-function calculateAccuracy() { if (totalNotesInSong === 0) return 0; return Math.round((correctNotesCount / totalNotesInSong) * 100); }
-
-// --- NUOVA FUNZIONE PER ESPORTARE COME PNG ---
-function exportSheetAsPNG() {
-    const sheetContainer = document.getElementById('pentagramma-container');
-    const svgElement = sheetContainer.querySelector('svg'); // Verifica che ci sia un SVG
-
+async function exportPentagrammaAsPNG() {
+    const svgElement = container.querySelector('svg');
     if (!svgElement) {
-        alert("Nessuna partitura caricata da esportare.");
-        return;
-    }
-    if (typeof html2canvas === 'undefined') {
-        alert("Errore: la libreria html2canvas non è stata caricata.");
-        console.error("html2canvas non è definito. Controlla l'inclusione dello script in index.html.");
+        alert("Nessun pentagramma da esportare!");
         return;
     }
 
-    console.log("[EXPORT PNG] Avvio esportazione...");
-    if(exportPngButton) exportPngButton.disabled = true; // Disabilita durante l'esportazione
-    if(playbackStatus) playbackStatus.textContent = "Esportazione PNG...";
+     if(statusDisplay) statusDisplay.textContent = "Esportazione in corso...";
+     exportPngButton.disabled = true;
 
-    // Opzioni per html2canvas
-    const options = {
-        scale: 2, // Aumenta la scala per una risoluzione migliore (es. 2x)
-        useCORS: true,
-        logging: false, // Disabilita i log di html2canvas in console (opzionale)
-        backgroundColor: '#ffffff' // Forza sfondo bianco per l'immagine
-    };
+    try {
+        const canvas = await html2canvas(container, {
+            scale: 3,
+            logging: false,
+            useCORS: true
+        });
 
-    // Memorizza gli stili originali per ripristinarli dopo
-    const originalOverflowY = sheetContainer.style.overflowY;
-    const originalMaxHeight = sheetContainer.style.maxHeight;
+        const imgData = canvas.toDataURL('image/png');
+        const link = document.createElement('a');
+        link.download = 'partitura.png';
+        link.href = imgData;
 
-    // Modifica temporaneamente lo stile per catturare tutto il contenuto
-    sheetContainer.style.overflowY = 'visible';
-    sheetContainer.style.maxHeight = 'none';
-    // Forza un reflow per assicurarsi che le modifiche siano applicate prima dello screenshot
-    void sheetContainer.offsetWidth;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
 
-    html2canvas(sheetContainer, options).then(canvas => {
-        // Ripristina immediatamente gli stili originali
-        sheetContainer.style.overflowY = originalOverflowY;
-        sheetContainer.style.maxHeight = originalMaxHeight;
+        console.log("[EXPORT] Partitura esportata come PNG.");
+        if(statusDisplay) statusDisplay.textContent = "Esportazione completata!";
 
-        console.log("[EXPORT PNG] Canvas generato, creazione immagine...");
-        const imageURL = canvas.toDataURL('image/png');
-
-        // Crea un link temporaneo per il download
-        const downloadLink = document.createElement('a');
-        downloadLink.href = imageURL;
-        // Prova a usare il nome del file caricato se disponibile, altrimenti usa un default
-        const inputFileName = fileInput.files[0]?.name.replace(/\.(mid|midi)$/i, '') || 'partitura';
-        downloadLink.download = `${inputFileName}.png`;
-
-        // Simula il click sul link per avviare il download
-        document.body.appendChild(downloadLink);
-        downloadLink.click();
-        document.body.removeChild(downloadLink);
-
-        console.log("[EXPORT PNG] Esportazione completata.");
-        if(exportPngButton) exportPngButton.disabled = false; // Riabilita il pulsante
-        if(playbackStatus) playbackStatus.textContent = ""; // Pulisci lo stato
-
-    }).catch(error => {
-        // Assicurati di ripristinare gli stili anche in caso di errore
-        sheetContainer.style.overflowY = originalOverflowY;
-        sheetContainer.style.maxHeight = originalMaxHeight;
-
-        console.error("[EXPORT PNG] Errore durante l'esportazione:", error);
-        alert("Si è verificato un errore durante l'esportazione dell'immagine PNG.");
-        if(exportPngButton) exportPngButton.disabled = false; // Riabilita il pulsante
-        if(playbackStatus) playbackStatus.textContent = ""; // Pulisci lo stato
-    });
+    } catch (e) {
+        console.error("[EXPORT] Errore durante l'esportazione PNG:", e);
+        alert("Errore durante l'esportazione della partitura.");
+         if(statusDisplay) statusDisplay.textContent = "Erro esportazione.";
+    } finally {
+         exportPngButton.disabled = false;
+    }
 }
 
+function init() {
+    console.log("[INIT] Inizializzazione...");
+    if (!container || !fileInput || !statusDisplay || !playButton || !stopButton || !exportPngButton || !speedSlider || !speedValueSpan || !accuracyDisplay) {
+        console.error("Elementi UI principali non trovati!");
+        alert("Errore interfaccia. Ricarica la pagina.");
+        disableButtons();
+        return;
+    }
 
-// --- Avvio Applicazione ---
+    setupRenderer();
+    disableButtons();
+
+    fileInput.addEventListener('change', handleFileSelect, false);
+    playButton.addEventListener('click', startPlayback);
+    stopButton.addEventListener('click', stopPlayback);
+    exportPngButton.addEventListener('click', exportPentagrammaAsPNG);
+
+    speedSlider.addEventListener('input', (event) => {
+         updateSpeedDisplay(event.target.value);
+    });
+     updateSpeedDisplay(speedSlider.value);
+
+    window.simulateMidiInput = (midiNumber) => {
+         handleUserNoteInput(midiNumber);
+    };
+    console.log("DEBUG: Puoi simulare input MIDI chiamando simulateMidiInput(midiNumber) nella console.");
+
+    if(statusDisplay) statusDisplay.textContent = "Carica un file MIDI.";
+    console.log("[INIT] Inizializzazione completata.");
+}
+
 if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', init);
 } else {
